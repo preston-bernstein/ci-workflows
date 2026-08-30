@@ -35,9 +35,22 @@ on:
       timeout-minutes:
         type: number
         default: 15
+      fetch-depth:
+        description: 'Commits to fetch. 0 fetches full history, which some audit tools need.'
+        type: number
+        default: 1
+      env:
+        description: 'Extra environment variables for every stage, one KEY=VALUE per line.'
+        type: string
+        default: ''
       runs-on:
         type: string
         default: 'ubuntu-latest'
+
+    secrets:
+      ssh-private-key:
+        description: 'Deploy key for private dependencies pulled over SSH during install.'
+        required: false
 
 permissions:
   contents: read
@@ -47,6 +60,8 @@ jobs:
     name: go
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      SSH_PRIVATE_KEY: ${{ secrets.ssh-private-key }}
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -55,6 +70,29 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: ${{ inputs.fetch-depth }}
+
+      - name: Apply extra environment
+        if: inputs.env != ''
+        env:
+          EXTRA: ${{ inputs.env }}
+        run: |
+          set -euo pipefail
+          # Values reach later steps through GITHUB_ENV rather than being
+          # interpolated into a shell command, so a value with metacharacters
+          # in it cannot inject code.
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+            printf 'set %s\n' "${line%%=*}"
+          done <<< "$EXTRA"
+
+      - name: Load deploy key
+        if: env.SSH_PRIVATE_KEY != ''
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.ssh-private-key }}
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
