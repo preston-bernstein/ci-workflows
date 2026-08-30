@@ -65,7 +65,7 @@ jobs:
           PATHS: ${{ inputs.shellcheck-paths }}
         run: |
           set -euo pipefail
-          mkdir -p .ci-logs
+          mkdir -p "$RUNNER_TEMP/ci-logs"
           # Match by extension and by shebang, so extensionless scripts are covered.
           if [ -n "$PATHS" ]; then
             roots="$PATHS"
@@ -79,11 +79,11 @@ jobs:
                   *.sh|*.bash) printf '%s\n' "$f" ;;
                   *) head -c 100 "$f" 2>/dev/null | head -n 1 | grep -qE '^#!.*\b(ba|da|k|z)?sh\b' && printf '%s\n' "$f" ;;
                 esac
-              done | sort > .ci-logs/scripts.txt || true
-          count=$(wc -l < .ci-logs/scripts.txt | tr -d ' ')
+              done | sort > "$RUNNER_TEMP/ci-logs/scripts.txt" || true
+          count=$(wc -l < "$RUNNER_TEMP/ci-logs/scripts.txt" | tr -d ' ')
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "Found $count shell script(s)."
-          cat .ci-logs/scripts.txt
+          cat "$RUNNER_TEMP/ci-logs/scripts.txt"
 
       - name: ShellCheck
         id: shellcheck
@@ -100,7 +100,7 @@ jobs:
             args="$args --exclude=$EXCLUDE"
           fi
           # shellcheck disable=SC2086
-          xargs -a .ci-logs/scripts.txt shellcheck $args 2>&1 | tee .ci-logs/shellcheck.log
+          xargs -a "$RUNNER_TEMP/ci-logs/scripts.txt" shellcheck $args 2>&1 | tee "$RUNNER_TEMP/ci-logs"/shellcheck.log
 
       - name: Repo checks
         id: checks
@@ -110,13 +110,13 @@ jobs:
           CHECKS: ${{ inputs.checks }}
         run: |
           set -u
-          : > .ci-logs/checks.tsv
+          : > "$RUNNER_TEMP/ci-logs/checks.tsv"
           overall=0
           i=0
           while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
             i=$((i + 1))
-            log=".ci-logs/check-$i.log"
+            log="$RUNNER_TEMP/ci-logs/check-$i.log"
             echo "::group::$cmd"
             if bash -c "$cmd" > "$log" 2>&1; then
               res=success
@@ -126,7 +126,7 @@ jobs:
             fi
             cat "$log"
             echo "::endgroup::"
-            printf '%s\t%s\t%s\n' "$res" "$i" "$cmd" >> .ci-logs/checks.tsv
+            printf '%s\t%s\t%s\n' "$res" "$i" "$cmd" >> "$RUNNER_TEMP/ci-logs/checks.tsv"
           done <<< "$CHECKS"
           echo "Ran $i repo check(s)."
           exit "$overall"
@@ -155,38 +155,38 @@ jobs:
             echo "| --- | --- |"
             echo "| ShellCheck | $(label "${R_SHELLCHECK:-}") |"
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ -f .ci-logs/checks.tsv ]; then
+          if [ -f "$RUNNER_TEMP/ci-logs/checks.tsv" ]; then
             while IFS="$(printf '\t')" read -r res idx cmd; do
               echo "| \`$cmd\` | $(label "$res") |" >> "$GITHUB_STEP_SUMMARY"
-            done < .ci-logs/checks.tsv
+            done < "$RUNNER_TEMP/ci-logs/checks.tsv"
           fi
-          if [ "${R_SHELLCHECK:-}" = "failure" ] && [ -f .ci-logs/shellcheck.log ]; then
+          if [ "${R_SHELLCHECK:-}" = "failure" ] && [ -f "$RUNNER_TEMP/ci-logs/shellcheck.log" ]; then
             {
               echo
               echo "<details><summary>ShellCheck — last 60 lines</summary>"
               echo
               echo '```'
-              tail -n 60 .ci-logs/shellcheck.log
+              tail -n 60 "$RUNNER_TEMP/ci-logs/shellcheck.log"
               echo '```'
               echo
               echo "</details>"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-          if [ -f .ci-logs/checks.tsv ]; then
+          if [ -f "$RUNNER_TEMP/ci-logs/checks.tsv" ]; then
             while IFS="$(printf '\t')" read -r res idx cmd; do
-              if [ "$res" = "failure" ] && [ -f ".ci-logs/check-$idx.log" ]; then
+              if [ "$res" = "failure" ] && [ -f "$RUNNER_TEMP/ci-logs/check-$idx.log" ]; then
                 {
                   echo
                   echo "<details><summary>$cmd — last 40 lines</summary>"
                   echo
                   echo '```'
-                  tail -n 40 ".ci-logs/check-$idx.log"
+                  tail -n 40 "$RUNNER_TEMP/ci-logs/check-$idx.log"
                   echo '```'
                   echo
                   echo "</details>"
                 } >> "$GITHUB_STEP_SUMMARY"
               fi
-            done < .ci-logs/checks.tsv
+            done < "$RUNNER_TEMP/ci-logs/checks.tsv"
           fi
 
       - name: Upload logs when a stage failed
@@ -194,7 +194,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-logs-shell
-          path: ${{ inputs.working-directory }}/.ci-logs/
+          path: ${{ runner.temp }}/ci-logs/
           retention-days: 7
           if-no-files-found: ignore
 

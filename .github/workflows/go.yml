@@ -105,7 +105,7 @@ jobs:
         id: toolchain
         run: |
           set -euo pipefail
-          mkdir -p .ci-logs
+          mkdir -p "$RUNNER_TEMP/ci-logs"
           echo "version=$(go version)" >> "$GITHUB_OUTPUT"
           go version
 
@@ -117,7 +117,7 @@ jobs:
           CMD: ${{ inputs.build }}
         run: |
           set -o pipefail
-          bash -c "$CMD" 2>&1 | tee .ci-logs/build.log
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/build.log
 
       - name: Vet
         id: vet
@@ -127,7 +127,7 @@ jobs:
           CMD: ${{ inputs.vet }}
         run: |
           set -o pipefail
-          bash -c "$CMD" 2>&1 | tee .ci-logs/vet.log
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/vet.log
 
       - name: golangci-lint
         id: lint
@@ -145,7 +145,7 @@ jobs:
           CMD: ${{ inputs.test }}
         run: |
           set -o pipefail
-          bash -c "$CMD" 2>&1 | tee .ci-logs/test.log
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/test.log
 
       - name: Summary
         if: always()
@@ -185,13 +185,13 @@ jobs:
             key="${pair%%:*}"
             var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
             res="$(eval "printf '%s' \"\${$var:-}\"")"
-            if [ "$res" = "failure" ] && [ -f ".ci-logs/$key.log" ]; then
+            if [ "$res" = "failure" ] && [ -f "$RUNNER_TEMP/ci-logs/$key.log" ]; then
               {
                 echo
                 echo "<details><summary>$key — last 40 lines</summary>"
                 echo
                 echo '```'
-                tail -n 40 ".ci-logs/$key.log"
+                tail -n 40 "$RUNNER_TEMP/ci-logs/$key.log"
                 echo '```'
                 echo
                 echo "</details>"
@@ -206,7 +206,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-logs-go
-          path: ${{ inputs.working-directory }}/.ci-logs/
+          path: ${{ runner.temp }}/ci-logs/
           retention-days: 7
           if-no-files-found: ignore
 

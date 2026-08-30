@@ -57,7 +57,7 @@ jobs:
           VERSION: ${{ inputs.actionlint-version }}
         run: |
           set -euo pipefail
-          mkdir -p .ci-logs "$HOME/.local/bin"
+          mkdir -p "$RUNNER_TEMP/ci-logs" "$HOME/.local/bin"
           url="https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
           curl -fsSL "$url" -o /tmp/actionlint.tar.gz
           tar -xzf /tmp/actionlint.tar.gz -C "$HOME/.local/bin" actionlint
@@ -70,7 +70,7 @@ jobs:
         run: |
           set -o pipefail
           actionlint --version
-          actionlint -color 2>&1 | tee .ci-logs/actionlint.log
+          actionlint -color 2>&1 | tee "$RUNNER_TEMP/ci-logs"/actionlint.log
 
       - name: Set up uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
@@ -125,7 +125,7 @@ jobs:
             --persona "$PERSONA" \
             --min-severity "$MIN_SEVERITY" \
             --format plain \
-            . 2>&1 | tee .ci-logs/zizmor.log
+            . 2>&1 | tee "$RUNNER_TEMP/ci-logs"/zizmor.log
 
       - name: Summary
         if: always()
@@ -158,13 +158,13 @@ jobs:
           for pair in actionlint:R_ACTIONLINT zizmor:R_ZIZMOR; do
             key="${pair%%:*}"; var="${pair#*:}"
             res="$(eval "printf '%s' \"\${$var:-}\"")"
-            if [ "$res" = "failure" ] && [ -f ".ci-logs/$key.log" ]; then
+            if [ "$res" = "failure" ] && [ -f "$RUNNER_TEMP/ci-logs/$key.log" ]; then
               {
                 echo
                 echo "<details><summary>$key findings</summary>"
                 echo
                 echo '```'
-                tail -n 80 ".ci-logs/$key.log"
+                tail -n 80 "$RUNNER_TEMP/ci-logs/$key.log"
                 echo '```'
                 echo
                 echo "</details>"
