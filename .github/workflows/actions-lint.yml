@@ -26,6 +26,10 @@ on:
         description: 'unknown, informational, low, medium, high'
         type: string
         default: 'medium'
+      trusted-owner:
+        description: 'Owner whose reusable workflows may be referenced by tag instead of a commit SHA.'
+        type: string
+        default: 'preston-bernstein'
       fail-on-zizmor:
         description: 'Fail the job on zizmor findings. Off while a repo works through its backlog.'
         type: boolean
@@ -73,6 +77,33 @@ jobs:
         with:
           enable-cache: false
 
+      - name: Resolve zizmor config
+        id: zizmor-config
+        env:
+          OWNER: ${{ inputs.trusted-owner }}
+        run: |
+          set -euo pipefail
+          # A repo that ships its own config wins. Otherwise generate one that
+          # still demands a commit SHA for third-party actions, but allows this
+          # account's own reusable workflows to be referenced by tag -- that tag
+          # is how a change here reaches every repo without 40 pin bumps.
+          if [ -f .github/zizmor.yml ] || [ -f .github/zizmor.yaml ]; then
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "Using the repo's own zizmor config."
+          else
+            {
+              printf 'rules:\n'
+              printf '  unpinned-uses:\n'
+              printf '    config:\n'
+              printf '      policies:\n'
+              printf '        %s/*: ref-pin\n' "$OWNER"
+              printf '        "*": hash-pin\n'
+            } > /tmp/zizmor-default.yml
+            echo "path=/tmp/zizmor-default.yml" >> "$GITHUB_OUTPUT"
+            echo "Using the generated default config:"
+            cat /tmp/zizmor-default.yml
+          fi
+
       - name: zizmor
         id: zizmor
         continue-on-error: true
@@ -80,10 +111,17 @@ jobs:
           VERSION: ${{ inputs.zizmor-version }}
           PERSONA: ${{ inputs.zizmor-persona }}
           MIN_SEVERITY: ${{ inputs.zizmor-min-severity }}
+          CONFIG: ${{ steps.zizmor-config.outputs.path }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -o pipefail
+          args=""
+          if [ -n "$CONFIG" ]; then
+            args="--config $CONFIG"
+          fi
+          # shellcheck disable=SC2086
           uvx "zizmor@${VERSION}" \
+            $args \
             --persona "$PERSONA" \
             --min-severity "$MIN_SEVERITY" \
             --format plain \
