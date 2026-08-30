@@ -1,0 +1,401 @@
+name: Python CI
+
+# Reusable CI for Python repos. Callers pass the commands their repo actually
+# uses; every stage is optional and is skipped when its input is empty.
+#
+# Every stage runs even when an earlier one fails, so a single run reports every
+# problem instead of only the first. The job still fails if any stage failed.
+#
+# All command inputs are passed through the environment rather than interpolated
+# into the shell, so a value containing shell metacharacters cannot inject code.
+
+on:
+  workflow_call:
+    inputs:
+      python-versions:
+        description: 'JSON array of Python versions to test, e.g. ["3.11","3.12"]'
+        type: string
+        default: '["3.12"]'
+      install:
+        description: 'Dependency install command. Empty means auto-detect.'
+        type: string
+        default: ''
+      setup:
+        description: 'Command run after install, before the stages. For example a browser download.'
+        type: string
+        default: ''
+      checks:
+        description: 'Repo-specific guard commands, one per line. Each gets its own summary row.'
+        type: string
+        default: ''
+      lint:
+        description: 'Lint command. Empty skips the stage.'
+        type: string
+        default: 'ruff check .'
+      format-check:
+        description: 'Format check command. Empty skips the stage.'
+        type: string
+        default: ''
+      typecheck:
+        description: 'Type check command. Empty skips the stage.'
+        type: string
+        default: ''
+      test:
+        description: 'Test command. Empty skips the stage.'
+        type: string
+        default: 'pytest -q'
+      working-directory:
+        type: string
+        default: '.'
+      timeout-minutes:
+        type: number
+        default: 15
+      non-blocking:
+        description: >-
+          Stage keys whose failure is reported but does not fail the job, space
+          separated. For adopting a check on a codebase that does not pass it
+          yet: the result still appears in the summary. Keys are the lowercase
+          stage ids, for example "lint".
+        type: string
+        default: ''
+      fetch-depth:
+        description: 'Commits to fetch. 0 fetches full history, which some audit tools need.'
+        type: number
+        default: 1
+      env:
+        description: 'Extra environment variables for every stage, one KEY=VALUE per line.'
+        type: string
+        default: ''
+      runs-on:
+        type: string
+        default: 'ubuntu-latest'
+
+    secrets:
+      ssh-private-key:
+        description: 'Deploy key for private dependencies pulled over SSH during install.'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: python ${{ matrix.python-version }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      SSH_PRIVATE_KEY: ${{ secrets.ssh-private-key }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ inputs.fetch-depth }}
+
+      - name: Apply extra environment
+        if: inputs.env != ''
+        env:
+          EXTRA: ${{ inputs.env }}
+        run: |
+          set -euo pipefail
+          # Values reach later steps through GITHUB_ENV rather than being
+          # interpolated into a shell command, so a value with metacharacters
+          # in it cannot inject code.
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+            printf 'set %s\n' "${line%%=*}"
+          done <<< "$EXTRA"
+
+      - name: Load deploy key
+        if: env.SSH_PRIVATE_KEY != ''
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.ssh-private-key }}
+
+      - name: Look for a dependency manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          # setup-python's pip cache errors outright when it can find nothing to
+          # key on, so only ask for it when a manifest exists. media-scan-gate
+          # installs pytest directly and has neither file.
+          if [ -f pyproject.toml ] || [ -f requirements.txt ]; then
+            echo "cache=pip" >> "$GITHUB_OUTPUT"
+          else
+            echo "cache=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: ${{ steps.manifest.outputs.cache }}
+
+      - name: Resolve install command
+        id: resolve
+        env:
+          EXPLICIT: ${{ inputs.install }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ci-logs"
+          if [ -n "$EXPLICIT" ]; then
+            cmd="$EXPLICIT"
+            why="caller-supplied"
+          elif [ -f pyproject.toml ] && grep -qE '^\s*(dev|test)\s*=\s*\[' pyproject.toml; then
+            cmd='pip install -e ".[dev,test]" || pip install -e ".[dev]" || pip install -e ".[test]" || pip install -e .'
+            why="pyproject.toml with dev/test extras"
+          elif [ -f pyproject.toml ]; then
+            cmd='pip install -e .'
+            why="pyproject.toml, no dev/test extras detected"
+          elif [ -f requirements.txt ]; then
+            cmd='pip install -r requirements.txt'
+            why="requirements.txt"
+          else
+            cmd=':'
+            why="no dependency manifest found"
+          fi
+          {
+            echo "cmd<<CI_EOF"
+            echo "$cmd"
+            echo "CI_EOF"
+            echo "why=$why"
+          } >> "$GITHUB_OUTPUT"
+          echo "Install strategy: $why"
+          echo "Command: $cmd"
+
+      - name: Install dependencies
+        id: install
+        continue-on-error: true
+        env:
+          CMD: ${{ steps.resolve.outputs.cmd }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/install.log
+
+      - name: Setup
+        id: setup
+        if: inputs.setup != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.setup }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/setup.log
+
+      - name: Lint
+        id: lint
+        if: inputs.lint != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.lint }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/lint.log
+
+      - name: Format check
+        id: format
+        if: inputs.format-check != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.format-check }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/format.log
+
+      - name: Type check
+        id: typecheck
+        if: inputs.typecheck != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.typecheck }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/typecheck.log
+
+      - name: Tests
+        id: test
+        if: inputs.test != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.test }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/test.log
+
+      - name: Repo checks
+        id: checks
+        if: inputs.checks != ''
+        continue-on-error: true
+        env:
+          CHECKS: ${{ inputs.checks }}
+        run: |
+          set -u
+          : > "$RUNNER_TEMP/ci-logs/checks.tsv"
+          overall=0
+          i=0
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            i=$((i + 1))
+            log="$RUNNER_TEMP/ci-logs/check-$i.log"
+            echo "::group::$cmd"
+            if bash -c "$cmd" > "$log" 2>&1; then
+              res=success
+            else
+              res=failure
+              overall=1
+            fi
+            cat "$log"
+            echo "::endgroup::"
+            printf '%s\t%s\t%s\n' "$res" "$i" "$cmd" >> "$RUNNER_TEMP/ci-logs/checks.tsv"
+          done <<< "$CHECKS"
+          echo "Ran $i repo check(s)."
+          exit "$overall"
+
+      - name: Summary
+        if: always()
+        env:
+          HEADING: "Python CI — Python ${{ matrix.python-version }}"
+          NOTE: "Install strategy: ${{ steps.resolve.outputs.why }}"
+          NON_BLOCKING: ${{ inputs.non-blocking }}
+          STAGES: |
+            install:Install
+            setup:Setup
+            lint:Lint
+            format:Format
+            typecheck:Type check
+            test:Tests
+          R_INSTALL: ${{ steps.install.outcome }}
+          R_SETUP: ${{ steps.setup.outcome }}
+          R_LINT: ${{ steps.lint.outcome }}
+          R_FORMAT: ${{ steps.format.outcome }}
+          R_TYPECHECK: ${{ steps.typecheck.outcome }}
+          R_TEST: ${{ steps.test.outcome }}
+        run: |
+          set -u
+          soft() { case " $NON_BLOCKING " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+          label() {
+            case "$1" in
+              success) echo ':white_check_mark: pass' ;;
+              failure) if soft "$2"; then echo ':warning: fail (not blocking)'; else echo ':x: FAIL'; fi ;;
+              skipped|'') echo ':heavy_minus_sign: skipped' ;;
+              *) echo "$1" ;;
+            esac
+          }
+          {
+            echo "## $HEADING"
+            echo
+            echo "$NOTE"
+            echo
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r pair; do
+            [ -z "$pair" ] && continue
+            key="${pair%%:*}"
+            name="${pair#*:}"
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            echo "| $name | $(label "$res" "$key") |" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "$STAGES"
+          if [ -f "$RUNNER_TEMP/ci-logs/checks.tsv" ]; then
+            while IFS="$(printf '\t')" read -r res idx cmd; do
+              echo "| \`$cmd\` | $(label "$res" checks) |" >> "$GITHUB_STEP_SUMMARY"
+            done < "$RUNNER_TEMP/ci-logs/checks.tsv"
+          fi
+          while IFS= read -r pair; do
+            [ -z "$pair" ] && continue
+            key="${pair%%:*}"
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            if [ "$res" = "failure" ] && [ -f "$RUNNER_TEMP/ci-logs/$key.log" ]; then
+              {
+                echo
+                echo "<details><summary>$key — last 40 lines</summary>"
+                echo
+                echo '```'
+                tail -n 40 "$RUNNER_TEMP/ci-logs/$key.log"
+                echo '```'
+                echo
+                echo "</details>"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done <<< "$STAGES"
+          if [ -f "$RUNNER_TEMP/ci-logs/checks.tsv" ]; then
+            while IFS="$(printf '\t')" read -r res idx cmd; do
+              if [ "$res" = "failure" ] && [ -f "$RUNNER_TEMP/ci-logs/check-$idx.log" ]; then
+                {
+                  echo
+                  echo "<details><summary>$cmd — last 40 lines</summary>"
+                  echo
+                  echo '```'
+                  tail -n 40 "$RUNNER_TEMP/ci-logs/check-$idx.log"
+                  echo '```'
+                  echo
+                  echo "</details>"
+                } >> "$GITHUB_STEP_SUMMARY"
+              fi
+            done < "$RUNNER_TEMP/ci-logs/checks.tsv"
+          fi
+
+      - name: Upload logs when a stage failed
+        if: >-
+          steps.install.outcome == 'failure' || steps.setup.outcome == 'failure' ||
+          steps.lint.outcome == 'failure' || steps.format.outcome == 'failure' ||
+          steps.typecheck.outcome == 'failure' || steps.test.outcome == 'failure' ||
+          steps.checks.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-logs-python-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/ci-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Fail if any stage failed
+        if: always()
+        env:
+          NON_BLOCKING: ${{ inputs.non-blocking }}
+          KEYS: |
+            install
+            setup
+            lint
+            format
+            typecheck
+            test
+            checks
+          R_INSTALL: ${{ steps.install.outcome }}
+          R_SETUP: ${{ steps.setup.outcome }}
+          R_LINT: ${{ steps.lint.outcome }}
+          R_FORMAT: ${{ steps.format.outcome }}
+          R_TYPECHECK: ${{ steps.typecheck.outcome }}
+          R_TEST: ${{ steps.test.outcome }}
+          R_CHECKS: ${{ steps.checks.outcome }}
+        run: |
+          set -u
+          fail=0
+          soft() { case " $NON_BLOCKING " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+          while IFS= read -r key; do
+            [ -z "$key" ] && continue
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            if [ "$res" = "failure" ]; then
+              if soft "$key"; then
+                echo "::warning::Stage '$key' failed but is listed as non-blocking."
+              else
+                fail=1
+              fi
+            fi
+          done <<< "$KEYS"
+          if [ "$fail" != "0" ]; then
+            echo "::error::One or more CI stages failed. The job summary has the stage table and the tail of each failing log."
+            exit 1
+          fi
+          echo "All blocking stages passed."

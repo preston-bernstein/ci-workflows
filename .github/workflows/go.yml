@@ -1,0 +1,262 @@
+name: Go CI
+
+# Reusable CI for Go repos. The Go version comes from go.mod by default, so a
+# module bump does not need a matching CI edit.
+#
+# Every stage runs even when an earlier one fails, so a single run reports every
+# problem instead of only the first. The job still fails if any stage failed.
+
+on:
+  workflow_call:
+    inputs:
+      go-version-file:
+        type: string
+        default: 'go.mod'
+      go-version:
+        description: 'Explicit Go version. Overrides go-version-file when set.'
+        type: string
+        default: ''
+      build:
+        type: string
+        default: 'go build ./...'
+      vet:
+        type: string
+        default: 'go vet ./...'
+      test:
+        type: string
+        default: 'go test -race ./...'
+      golangci-lint:
+        description: 'Run golangci-lint. Off by default so it is opt-in per repo.'
+        type: boolean
+        default: false
+      working-directory:
+        type: string
+        default: '.'
+      timeout-minutes:
+        type: number
+        default: 15
+      non-blocking:
+        description: >-
+          Stage keys whose failure is reported but does not fail the job, space
+          separated. For adopting a check on a codebase that does not pass it
+          yet: the result still appears in the summary. Keys are the lowercase
+          stage ids, for example "lint".
+        type: string
+        default: ''
+      fetch-depth:
+        description: 'Commits to fetch. 0 fetches full history, which some audit tools need.'
+        type: number
+        default: 1
+      env:
+        description: 'Extra environment variables for every stage, one KEY=VALUE per line.'
+        type: string
+        default: ''
+      runs-on:
+        type: string
+        default: 'ubuntu-latest'
+
+    secrets:
+      ssh-private-key:
+        description: 'Deploy key for private dependencies pulled over SSH during install.'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: go
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      SSH_PRIVATE_KEY: ${{ secrets.ssh-private-key }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ inputs.fetch-depth }}
+
+      - name: Apply extra environment
+        if: inputs.env != ''
+        env:
+          EXTRA: ${{ inputs.env }}
+        run: |
+          set -euo pipefail
+          # Values reach later steps through GITHUB_ENV rather than being
+          # interpolated into a shell command, so a value with metacharacters
+          # in it cannot inject code.
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+            printf 'set %s\n' "${line%%=*}"
+          done <<< "$EXTRA"
+
+      - name: Load deploy key
+        if: env.SSH_PRIVATE_KEY != ''
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.ssh-private-key }}
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ inputs.go-version }}
+          go-version-file: ${{ inputs.go-version == '' && format('{0}/{1}', inputs.working-directory, inputs.go-version-file) || '' }}
+          cache-dependency-path: ${{ inputs.working-directory }}/go.sum
+
+      - name: Record toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ci-logs"
+          echo "version=$(go version)" >> "$GITHUB_OUTPUT"
+          go version
+
+      - name: Build
+        id: build
+        if: inputs.build != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.build }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/build.log
+
+      - name: Vet
+        id: vet
+        if: inputs.vet != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.vet }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/vet.log
+
+      - name: golangci-lint
+        id: lint
+        if: inputs.golangci-lint
+        continue-on-error: true
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Tests
+        id: test
+        if: inputs.test != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.test }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/test.log
+
+      - name: Summary
+        if: always()
+        env:
+          HEADING: "Go CI"
+          NOTE: "Toolchain: ${{ steps.toolchain.outputs.version }}"
+          NON_BLOCKING: ${{ inputs.non-blocking }}
+          STAGES: |
+            build:Build
+            vet:Vet
+            lint:golangci-lint
+            test:Tests
+          R_BUILD: ${{ steps.build.outcome }}
+          R_VET: ${{ steps.vet.outcome }}
+          R_LINT: ${{ steps.lint.outcome }}
+          R_TEST: ${{ steps.test.outcome }}
+        run: |
+          set -u
+          soft() { case " $NON_BLOCKING " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+          label() {
+            case "$1" in
+              success) echo ':white_check_mark: pass' ;;
+              failure) if soft "$2"; then echo ':warning: fail (not blocking)'; else echo ':x: FAIL'; fi ;;
+              skipped|'') echo ':heavy_minus_sign: skipped' ;;
+              *) echo "$1" ;;
+            esac
+          }
+          {
+            echo "## $HEADING"
+            echo
+            echo "$NOTE"
+            echo
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r pair; do
+            [ -z "$pair" ] && continue
+            key="${pair%%:*}"; name="${pair#*:}"
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            echo "| $name | $(label "$res" "$key") |" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "$STAGES"
+          while IFS= read -r pair; do
+            [ -z "$pair" ] && continue
+            key="${pair%%:*}"
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            if [ "$res" = "failure" ] && [ -f "$RUNNER_TEMP/ci-logs/$key.log" ]; then
+              {
+                echo
+                echo "<details><summary>$key — last 40 lines</summary>"
+                echo
+                echo '```'
+                tail -n 40 "$RUNNER_TEMP/ci-logs/$key.log"
+                echo '```'
+                echo
+                echo "</details>"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done <<< "$STAGES"
+
+      - name: Upload logs when a stage failed
+        if: >-
+          steps.build.outcome == 'failure' || steps.vet.outcome == 'failure' ||
+          steps.test.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-logs-go
+          path: ${{ runner.temp }}/ci-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Fail if any stage failed
+        if: always()
+        env:
+          NON_BLOCKING: ${{ inputs.non-blocking }}
+          KEYS: |
+            build
+            vet
+            lint
+            test
+          R_BUILD: ${{ steps.build.outcome }}
+          R_VET: ${{ steps.vet.outcome }}
+          R_LINT: ${{ steps.lint.outcome }}
+          R_TEST: ${{ steps.test.outcome }}
+        run: |
+          set -u
+          fail=0
+          soft() { case " $NON_BLOCKING " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+          while IFS= read -r key; do
+            [ -z "$key" ] && continue
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            if [ "$res" = "failure" ]; then
+              if soft "$key"; then
+                echo "::warning::Stage '$key' failed but is listed as non-blocking."
+              else
+                fail=1
+              fi
+            fi
+          done <<< "$KEYS"
+          if [ "$fail" != "0" ]; then
+            echo "::error::One or more CI stages failed. The job summary has the stage table and the tail of each failing log."
+            exit 1
+          fi
+          echo "All blocking stages passed."

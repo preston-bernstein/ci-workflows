@@ -1,0 +1,428 @@
+name: Node CI
+
+# Reusable CI for Node/TypeScript repos. Callers pass the scripts their repo
+# actually defines; every stage is optional and is skipped when its input is
+# empty. The package manager is detected from the lockfile unless overridden.
+#
+# Every stage runs even when an earlier one fails, so a single run reports every
+# problem instead of only the first. The job still fails if any stage failed.
+
+on:
+  workflow_call:
+    inputs:
+      node-versions:
+        description: 'JSON array of Node versions, e.g. ["22"] or ["20","22"]'
+        type: string
+        default: '["22"]'
+      package-manager:
+        description: 'pnpm, npm, or empty to detect from the lockfile'
+        type: string
+        default: ''
+      install:
+        description: 'Install command. Empty means the package manager default.'
+        type: string
+        default: ''
+      setup:
+        description: 'Command run after install, before the stages. For example a browser download.'
+        type: string
+        default: ''
+      checks:
+        description: 'Repo-specific guard commands, one per line. Each gets its own summary row.'
+        type: string
+        default: ''
+      lint:
+        type: string
+        default: ''
+      format-check:
+        type: string
+        default: ''
+      typecheck:
+        type: string
+        default: ''
+      test:
+        type: string
+        default: ''
+      build:
+        type: string
+        default: ''
+      working-directory:
+        type: string
+        default: '.'
+      timeout-minutes:
+        type: number
+        default: 15
+      non-blocking:
+        description: >-
+          Stage keys whose failure is reported but does not fail the job, space
+          separated. For adopting a check on a codebase that does not pass it
+          yet: the result still appears in the summary. Keys are the lowercase
+          stage ids, for example "lint".
+        type: string
+        default: ''
+      fetch-depth:
+        description: 'Commits to fetch. 0 fetches full history, which some audit tools need.'
+        type: number
+        default: 1
+      env:
+        description: 'Extra environment variables for every stage, one KEY=VALUE per line.'
+        type: string
+        default: ''
+      runs-on:
+        type: string
+        default: 'ubuntu-latest'
+
+    secrets:
+      ssh-private-key:
+        description: 'Deploy key for private dependencies pulled over SSH during install.'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: node ${{ matrix.node-version }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      SSH_PRIVATE_KEY: ${{ secrets.ssh-private-key }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ${{ fromJSON(inputs.node-versions) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ inputs.fetch-depth }}
+
+      - name: Apply extra environment
+        if: inputs.env != ''
+        env:
+          EXTRA: ${{ inputs.env }}
+        run: |
+          set -euo pipefail
+          # Values reach later steps through GITHUB_ENV rather than being
+          # interpolated into a shell command, so a value with metacharacters
+          # in it cannot inject code.
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+            printf 'set %s\n' "${line%%=*}"
+          done <<< "$EXTRA"
+
+      - name: Load deploy key
+        if: env.SSH_PRIVATE_KEY != ''
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.ssh-private-key }}
+
+      - name: Detect package manager
+        id: pm
+        env:
+          EXPLICIT: ${{ inputs.package-manager }}
+          EXPLICIT_INSTALL: ${{ inputs.install }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ci-logs"
+          if [ -n "$EXPLICIT" ]; then
+            pm="$EXPLICIT"; why="caller-supplied"
+          elif [ -f pnpm-lock.yaml ]; then
+            pm=pnpm; why="pnpm-lock.yaml present"
+          elif [ -f package-lock.json ]; then
+            pm=npm; why="package-lock.json present"
+          elif [ -f package.json ]; then
+            pm=npm; why="package.json with no lockfile"
+          else
+            pm=none; why="no package.json found"
+          fi
+          if [ -n "$EXPLICIT_INSTALL" ]; then
+            install="$EXPLICIT_INSTALL"
+          elif [ "$pm" = "pnpm" ]; then
+            install="pnpm install --frozen-lockfile"
+          elif [ "$pm" = "npm" ] && [ -f package-lock.json ]; then
+            install="npm ci"
+          elif [ "$pm" = "npm" ]; then
+            install="npm install"
+          else
+            install=":"
+          fi
+          # Only enable setup-node's cache when the lockfile it keys on exists,
+          # otherwise the action fails on an unresolvable cache-dependency-path.
+          cache=""
+          cache_path=""
+          if [ "$pm" = "pnpm" ] && [ -f pnpm-lock.yaml ]; then
+            cache="pnpm"; cache_path="pnpm-lock.yaml"
+          elif [ "$pm" = "npm" ] && [ -f package-lock.json ]; then
+            cache="npm"; cache_path="package-lock.json"
+          fi
+          {
+            echo "pm=$pm"
+            echo "why=$why"
+            echo "cache=$cache"
+            echo "cache_path=$cache_path"
+            echo "install<<CI_EOF"
+            echo "$install"
+            echo "CI_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Package manager: $pm ($why)"
+          echo "Install command: $install"
+          echo "Dependency cache: ${cache:-disabled (no lockfile)}"
+
+      - name: Set up pnpm
+        if: steps.pm.outputs.pm == 'pnpm'
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
+      - name: Set up Node ${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: ${{ steps.pm.outputs.cache }}
+          cache-dependency-path: ${{ steps.pm.outputs.cache_path && format('{0}/{1}', inputs.working-directory, steps.pm.outputs.cache_path) || '' }}
+
+      - name: Install dependencies
+        id: install
+        continue-on-error: true
+        env:
+          CMD: ${{ steps.pm.outputs.install }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/install.log
+
+      - name: Setup
+        id: setup
+        if: inputs.setup != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.setup }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/setup.log
+
+      - name: Lint
+        id: lint
+        if: inputs.lint != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.lint }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/lint.log
+
+      - name: Format check
+        id: format
+        if: inputs.format-check != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.format-check }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/format.log
+
+      - name: Type check
+        id: typecheck
+        if: inputs.typecheck != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.typecheck }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/typecheck.log
+
+      - name: Tests
+        id: test
+        if: inputs.test != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.test }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/test.log
+
+      - name: Build
+        id: build
+        if: inputs.build != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.build }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee "$RUNNER_TEMP/ci-logs"/build.log
+
+      - name: Repo checks
+        id: checks
+        if: inputs.checks != ''
+        continue-on-error: true
+        env:
+          CHECKS: ${{ inputs.checks }}
+        run: |
+          set -u
+          : > "$RUNNER_TEMP/ci-logs/checks.tsv"
+          overall=0
+          i=0
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            i=$((i + 1))
+            log="$RUNNER_TEMP/ci-logs/check-$i.log"
+            echo "::group::$cmd"
+            if bash -c "$cmd" > "$log" 2>&1; then
+              res=success
+            else
+              res=failure
+              overall=1
+            fi
+            cat "$log"
+            echo "::endgroup::"
+            printf '%s\t%s\t%s\n' "$res" "$i" "$cmd" >> "$RUNNER_TEMP/ci-logs/checks.tsv"
+          done <<< "$CHECKS"
+          echo "Ran $i repo check(s)."
+          exit "$overall"
+
+      - name: Summary
+        if: always()
+        env:
+          HEADING: "Node CI — Node ${{ matrix.node-version }}"
+          NOTE: "Package manager: `${{ steps.pm.outputs.pm }}` (${{ steps.pm.outputs.why }})"
+          NON_BLOCKING: ${{ inputs.non-blocking }}
+          STAGES: |
+            install:Install
+            setup:Setup
+            lint:Lint
+            format:Format
+            typecheck:Type check
+            test:Tests
+            build:Build
+          R_INSTALL: ${{ steps.install.outcome }}
+          R_SETUP: ${{ steps.setup.outcome }}
+          R_LINT: ${{ steps.lint.outcome }}
+          R_FORMAT: ${{ steps.format.outcome }}
+          R_TYPECHECK: ${{ steps.typecheck.outcome }}
+          R_TEST: ${{ steps.test.outcome }}
+          R_BUILD: ${{ steps.build.outcome }}
+        run: |
+          set -u
+          soft() { case " $NON_BLOCKING " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+          label() {
+            case "$1" in
+              success) echo ':white_check_mark: pass' ;;
+              failure) if soft "$2"; then echo ':warning: fail (not blocking)'; else echo ':x: FAIL'; fi ;;
+              skipped|'') echo ':heavy_minus_sign: skipped' ;;
+              *) echo "$1" ;;
+            esac
+          }
+          {
+            echo "## $HEADING"
+            echo
+            echo "$NOTE"
+            echo
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r pair; do
+            [ -z "$pair" ] && continue
+            key="${pair%%:*}"; name="${pair#*:}"
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            echo "| $name | $(label "$res" "$key") |" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "$STAGES"
+          if [ -f "$RUNNER_TEMP/ci-logs/checks.tsv" ]; then
+            while IFS="$(printf '\t')" read -r res idx cmd; do
+              echo "| \`$cmd\` | $(label "$res" checks) |" >> "$GITHUB_STEP_SUMMARY"
+            done < "$RUNNER_TEMP/ci-logs/checks.tsv"
+          fi
+          while IFS= read -r pair; do
+            [ -z "$pair" ] && continue
+            key="${pair%%:*}"
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            if [ "$res" = "failure" ] && [ -f "$RUNNER_TEMP/ci-logs/$key.log" ]; then
+              {
+                echo
+                echo "<details><summary>$key — last 40 lines</summary>"
+                echo
+                echo '```'
+                tail -n 40 "$RUNNER_TEMP/ci-logs/$key.log"
+                echo '```'
+                echo
+                echo "</details>"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done <<< "$STAGES"
+          if [ -f "$RUNNER_TEMP/ci-logs/checks.tsv" ]; then
+            while IFS="$(printf '\t')" read -r res idx cmd; do
+              if [ "$res" = "failure" ] && [ -f "$RUNNER_TEMP/ci-logs/check-$idx.log" ]; then
+                {
+                  echo
+                  echo "<details><summary>$cmd — last 40 lines</summary>"
+                  echo
+                  echo '```'
+                  tail -n 40 "$RUNNER_TEMP/ci-logs/check-$idx.log"
+                  echo '```'
+                  echo
+                  echo "</details>"
+                } >> "$GITHUB_STEP_SUMMARY"
+              fi
+            done < "$RUNNER_TEMP/ci-logs/checks.tsv"
+          fi
+
+      - name: Upload logs when a stage failed
+        if: >-
+          steps.install.outcome == 'failure' || steps.setup.outcome == 'failure' ||
+          steps.lint.outcome == 'failure' || steps.format.outcome == 'failure' ||
+          steps.typecheck.outcome == 'failure' ||
+          steps.test.outcome == 'failure' || steps.build.outcome == 'failure' ||
+          steps.checks.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-logs-node-${{ matrix.node-version }}
+          path: ${{ runner.temp }}/ci-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Fail if any stage failed
+        if: always()
+        env:
+          NON_BLOCKING: ${{ inputs.non-blocking }}
+          KEYS: |
+            install
+            setup
+            lint
+            format
+            typecheck
+            test
+            build
+            checks
+          R_INSTALL: ${{ steps.install.outcome }}
+          R_SETUP: ${{ steps.setup.outcome }}
+          R_LINT: ${{ steps.lint.outcome }}
+          R_FORMAT: ${{ steps.format.outcome }}
+          R_TYPECHECK: ${{ steps.typecheck.outcome }}
+          R_TEST: ${{ steps.test.outcome }}
+          R_BUILD: ${{ steps.build.outcome }}
+          R_CHECKS: ${{ steps.checks.outcome }}
+        run: |
+          set -u
+          fail=0
+          soft() { case " $NON_BLOCKING " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+          while IFS= read -r key; do
+            [ -z "$key" ] && continue
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            if [ "$res" = "failure" ]; then
+              if soft "$key"; then
+                echo "::warning::Stage '$key' failed but is listed as non-blocking."
+              else
+                fail=1
+              fi
+            fi
+          done <<< "$KEYS"
+          if [ "$fail" != "0" ]; then
+            echo "::error::One or more CI stages failed. The job summary has the stage table and the tail of each failing log."
+            exit 1
+          fi
+          echo "All blocking stages passed."
