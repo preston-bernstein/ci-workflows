@@ -50,6 +50,14 @@ on:
       timeout-minutes:
         type: number
         default: 15
+      non-blocking:
+        description: >-
+          Stage keys whose failure is reported but does not fail the job, space
+          separated. For adopting a check on a codebase that does not pass it
+          yet: the result still appears in the summary. Keys are the lowercase
+          stage ids, for example "lint".
+        type: string
+        default: ''
       fetch-depth:
         description: 'Commits to fetch. 0 fetches full history, which some audit tools need.'
         type: number
@@ -244,6 +252,7 @@ jobs:
         env:
           HEADING: "Python CI — Python ${{ matrix.python-version }}"
           NOTE: "Install strategy: ${{ steps.resolve.outputs.why }}"
+          NON_BLOCKING: ${{ inputs.non-blocking }}
           STAGES: |
             install:Install
             setup:Setup
@@ -259,10 +268,11 @@ jobs:
           R_TEST: ${{ steps.test.outcome }}
         run: |
           set -u
+          soft() { case " $NON_BLOCKING " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
           label() {
             case "$1" in
               success) echo ':white_check_mark: pass' ;;
-              failure) echo ':x: FAIL' ;;
+              failure) if soft "$2"; then echo ':warning: fail (not blocking)'; else echo ':x: FAIL'; fi ;;
               skipped|'') echo ':heavy_minus_sign: skipped' ;;
               *) echo "$1" ;;
             esac
@@ -281,11 +291,11 @@ jobs:
             name="${pair#*:}"
             var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
             res="$(eval "printf '%s' \"\${$var:-}\"")"
-            echo "| $name | $(label "$res") |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| $name | $(label "$res" "$key") |" >> "$GITHUB_STEP_SUMMARY"
           done <<< "$STAGES"
           if [ -f "$RUNNER_TEMP/ci-logs/checks.tsv" ]; then
             while IFS="$(printf '\t')" read -r res idx cmd; do
-              echo "| \`$cmd\` | $(label "$res") |" >> "$GITHUB_STEP_SUMMARY"
+              echo "| \`$cmd\` | $(label "$res" checks) |" >> "$GITHUB_STEP_SUMMARY"
             done < "$RUNNER_TEMP/ci-logs/checks.tsv"
           fi
           while IFS= read -r pair; do
@@ -339,20 +349,40 @@ jobs:
       - name: Fail if any stage failed
         if: always()
         env:
+          NON_BLOCKING: ${{ inputs.non-blocking }}
+          KEYS: |
+            install
+            setup
+            lint
+            format
+            typecheck
+            test
+            checks
           R_INSTALL: ${{ steps.install.outcome }}
           R_SETUP: ${{ steps.setup.outcome }}
           R_LINT: ${{ steps.lint.outcome }}
           R_FORMAT: ${{ steps.format.outcome }}
           R_TYPECHECK: ${{ steps.typecheck.outcome }}
           R_TEST: ${{ steps.test.outcome }}
+          R_CHECKS: ${{ steps.checks.outcome }}
         run: |
           set -u
           fail=0
-          for r in "${R_INSTALL:-}" "${R_LINT:-}" "${R_FORMAT:-}" "${R_TYPECHECK:-}" "${R_TEST:-}"; do
-            [ "$r" = "failure" ] && fail=1
-          done
+          soft() { case " $NON_BLOCKING " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+          while IFS= read -r key; do
+            [ -z "$key" ] && continue
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            if [ "$res" = "failure" ]; then
+              if soft "$key"; then
+                echo "::warning::Stage '$key' failed but is listed as non-blocking."
+              else
+                fail=1
+              fi
+            fi
+          done <<< "$KEYS"
           if [ "$fail" != "0" ]; then
             echo "::error::One or more CI stages failed. The job summary has the stage table and the tail of each failing log."
             exit 1
           fi
-          echo "All stages passed."
+          echo "All blocking stages passed."
