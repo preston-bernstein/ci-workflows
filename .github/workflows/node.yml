@@ -33,6 +33,9 @@ on:
       lint:
         type: string
         default: ''
+      format-check:
+        type: string
+        default: ''
       typecheck:
         type: string
         default: ''
@@ -165,6 +168,16 @@ jobs:
           set -o pipefail
           bash -c "$CMD" 2>&1 | tee .ci-logs/lint.log
 
+      - name: Format check
+        id: format
+        if: inputs.format-check != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.format-check }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/format.log
+
       - name: Type check
         id: typecheck
         if: inputs.typecheck != ''
@@ -229,10 +242,11 @@ jobs:
         env:
           HEADING: "Node CI — Node ${{ matrix.node-version }}"
           NOTE: "Package manager: `${{ steps.pm.outputs.pm }}` (${{ steps.pm.outputs.why }})"
-          STAGES: "install:Install setup:Setup lint:Lint typecheck:Type check test:Tests build:Build"
+          STAGES: "install:Install setup:Setup lint:Lint format:Format typecheck:Type check test:Tests build:Build"
           R_INSTALL: ${{ steps.install.outcome }}
           R_SETUP: ${{ steps.setup.outcome }}
           R_LINT: ${{ steps.lint.outcome }}
+          R_FORMAT: ${{ steps.format.outcome }}
           R_TYPECHECK: ${{ steps.typecheck.outcome }}
           R_TEST: ${{ steps.test.outcome }}
           R_BUILD: ${{ steps.build.outcome }}
@@ -302,7 +316,8 @@ jobs:
       - name: Upload logs when a stage failed
         if: >-
           steps.install.outcome == 'failure' || steps.setup.outcome == 'failure' ||
-          steps.lint.outcome == 'failure' || steps.typecheck.outcome == 'failure' ||
+          steps.lint.outcome == 'failure' || steps.format.outcome == 'failure' ||
+          steps.typecheck.outcome == 'failure' ||
           steps.test.outcome == 'failure' || steps.build.outcome == 'failure' ||
           steps.checks.outcome == 'failure'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -318,6 +333,7 @@ jobs:
           R_INSTALL: ${{ steps.install.outcome }}
           R_SETUP: ${{ steps.setup.outcome }}
           R_LINT: ${{ steps.lint.outcome }}
+          R_FORMAT: ${{ steps.format.outcome }}
           R_TYPECHECK: ${{ steps.typecheck.outcome }}
           R_TEST: ${{ steps.test.outcome }}
           R_BUILD: ${{ steps.build.outcome }}
@@ -325,7 +341,7 @@ jobs:
         run: |
           set -u
           fail=0
-          for r in "${R_INSTALL:-}" "${R_SETUP:-}" "${R_LINT:-}" "${R_TYPECHECK:-}" "${R_TEST:-}" "${R_BUILD:-}" "${R_CHECKS:-}"; do
+          for r in "${R_INSTALL:-}" "${R_SETUP:-}" "${R_LINT:-}" "${R_FORMAT:-}" "${R_TYPECHECK:-}" "${R_TEST:-}" "${R_BUILD:-}" "${R_CHECKS:-}"; do
             [ "$r" = "failure" ] && fail=1
           done
           if [ "$fail" != "0" ]; then
