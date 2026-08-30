@@ -63,6 +63,7 @@ Beyond the stage commands, each workflow takes:
 | `checks` | Repo-specific guard commands, one per line, each with its own summary row |
 | `fetch-depth` | `0` when a tool diffs against the base ref and needs full history |
 | `env` | Extra environment variables for every stage, one `KEY=VALUE` per line |
+| `non-blocking` | Stage keys that report a failure without failing the job |
 | `timeout-minutes` | Overrides the default for a slow suite |
 | `runs-on` | A different runner label |
 
@@ -113,6 +114,14 @@ print which branch they took, in the log and in the summary.
 `ludeeus/action-shellcheck`, which has had no release since January 2023, and one
 repository referenced its `master` branch — a reference that can change under it
 at any time. The runner already ships ShellCheck.
+
+## Adopting a check on a codebase that does not pass it
+
+`non-blocking: lint` runs the stage and marks its result in the summary table,
+but does not fail the job. algo-corpus and algo-factory both configure ruff and
+had never run it, at 36 and 1192 findings; the alternative was a permanently red
+`main` or no linting at all. Deleting the line is what turns the check into a
+gate once the backlog is gone.
 
 ## Pinning policy
 
