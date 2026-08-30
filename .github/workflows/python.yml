@@ -244,7 +244,13 @@ jobs:
         env:
           HEADING: "Python CI — Python ${{ matrix.python-version }}"
           NOTE: "Install strategy: ${{ steps.resolve.outputs.why }}"
-          STAGES: "install:Install setup:Setup lint:Lint format:Format typecheck:Type check test:Tests"
+          STAGES: |
+            install:Install
+            setup:Setup
+            lint:Lint
+            format:Format
+            typecheck:Type check
+            test:Tests
           R_INSTALL: ${{ steps.install.outcome }}
           R_SETUP: ${{ steps.setup.outcome }}
           R_LINT: ${{ steps.lint.outcome }}
@@ -269,19 +275,21 @@ jobs:
             echo "| Stage | Result |"
             echo "| --- | --- |"
           } >> "$GITHUB_STEP_SUMMARY"
-          for pair in $STAGES; do
+          while IFS= read -r pair; do
+            [ -z "$pair" ] && continue
             key="${pair%%:*}"
             name="${pair#*:}"
             var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
             res="$(eval "printf '%s' \"\${$var:-}\"")"
             echo "| $name | $(label "$res") |" >> "$GITHUB_STEP_SUMMARY"
-          done
+          done <<< "$STAGES"
           if [ -f "$RUNNER_TEMP/ci-logs/checks.tsv" ]; then
             while IFS="$(printf '\t')" read -r res idx cmd; do
               echo "| \`$cmd\` | $(label "$res") |" >> "$GITHUB_STEP_SUMMARY"
             done < "$RUNNER_TEMP/ci-logs/checks.tsv"
           fi
-          for pair in $STAGES; do
+          while IFS= read -r pair; do
+            [ -z "$pair" ] && continue
             key="${pair%%:*}"
             var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
             res="$(eval "printf '%s' \"\${$var:-}\"")"
@@ -297,7 +305,7 @@ jobs:
                 echo "</details>"
               } >> "$GITHUB_STEP_SUMMARY"
             fi
-          done
+          done <<< "$STAGES"
           if [ -f "$RUNNER_TEMP/ci-logs/checks.tsv" ]; then
             while IFS="$(printf '\t')" read -r res idx cmd; do
               if [ "$res" = "failure" ] && [ -f "$RUNNER_TEMP/ci-logs/check-$idx.log" ]; then

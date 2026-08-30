@@ -152,7 +152,11 @@ jobs:
         env:
           HEADING: "Go CI"
           NOTE: "Toolchain: ${{ steps.toolchain.outputs.version }}"
-          STAGES: "build:Build vet:Vet lint:golangci-lint test:Tests"
+          STAGES: |
+            build:Build
+            vet:Vet
+            lint:golangci-lint
+            test:Tests
           R_BUILD: ${{ steps.build.outcome }}
           R_VET: ${{ steps.vet.outcome }}
           R_LINT: ${{ steps.lint.outcome }}
@@ -175,13 +179,15 @@ jobs:
             echo "| Stage | Result |"
             echo "| --- | --- |"
           } >> "$GITHUB_STEP_SUMMARY"
-          for pair in $STAGES; do
+          while IFS= read -r pair; do
+            [ -z "$pair" ] && continue
             key="${pair%%:*}"; name="${pair#*:}"
             var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
             res="$(eval "printf '%s' \"\${$var:-}\"")"
             echo "| $name | $(label "$res") |" >> "$GITHUB_STEP_SUMMARY"
-          done
-          for pair in $STAGES; do
+          done <<< "$STAGES"
+          while IFS= read -r pair; do
+            [ -z "$pair" ] && continue
             key="${pair%%:*}"
             var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
             res="$(eval "printf '%s' \"\${$var:-}\"")"
@@ -197,7 +203,7 @@ jobs:
                 echo "</details>"
               } >> "$GITHUB_STEP_SUMMARY"
             fi
-          done
+          done <<< "$STAGES"
 
       - name: Upload logs when a stage failed
         if: >-
