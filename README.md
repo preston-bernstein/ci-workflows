@@ -55,6 +55,25 @@ every caller once `v1` is moved, and a bad commit on `main` does not.
 Every stage input defaults to empty or to the command the repositories already
 ran. An empty input skips that stage, so a caller only names what it wants.
 
+Beyond the stage commands, each workflow takes:
+
+| Input | What it is for |
+| --- | --- |
+| `setup` | A command between install and the stages, such as a browser download |
+| `checks` | Repo-specific guard commands, one per line, each with its own summary row |
+| `fetch-depth` | `0` when a tool diffs against the base ref and needs full history |
+| `env` | Extra environment variables for every stage, one `KEY=VALUE` per line |
+| `timeout-minutes` | Overrides the default for a slow suite |
+| `runs-on` | A different runner label |
+
+The Python and Node workflows also accept an `ssh-private-key` secret, for a
+repo whose install pulls a private sibling over SSH:
+
+```yaml
+    secrets:
+      ssh-private-key: ${{ secrets.CREDENTIAL_CRYPTO_DEPLOY_KEY }}
+```
+
 ## What each workflow does that the old ones did not
 
 **Every stage runs, even after one fails.** Stages are marked
@@ -65,6 +84,11 @@ first and hiding the second until the next push.
 **Failures are readable from the run's summary page.** Each job writes a table of
 stages and results to `$GITHUB_STEP_SUMMARY`, and inlines the last 40 lines of
 any failing stage's log underneath it. Full logs upload as an artifact.
+
+Those logs are written to `$RUNNER_TEMP/ci-logs`, outside the checkout. Writing
+them into the working tree meant a repo's own tree-wide checks could see them:
+anno-1800-stamps validates that every tracked file is a zlib stream, and failed
+on the workflow's own log files.
 
 **Actions are pinned to a commit.** A tag like `v4` is a moving reference that
 whoever controls the action can repoint. Every `uses:` here names a 40-character
@@ -89,6 +113,14 @@ print which branch they took, in the log and in the summary.
 `ludeeus/action-shellcheck`, which has had no release since January 2023, and one
 repository referenced its `master` branch — a reference that can change under it
 at any time. The runner already ships ShellCheck.
+
+## Pinning policy
+
+The workflow linter requires a commit SHA for third-party actions, and allows a
+tag only for this account's own reusable workflows. Without that exception,
+`@v1` in every caller counts as an unpinned reference, and satisfying the linter
+would mean editing forty repos for each change here — the thing this repo exists
+to avoid. A repo that ships its own `.github/zizmor.yml` keeps it.
 
 ## Changing these workflows
 
