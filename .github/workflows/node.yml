@@ -22,6 +22,14 @@ on:
         description: 'Install command. Empty means the package manager default.'
         type: string
         default: ''
+      setup:
+        description: 'Command run after install, before the stages. For example a browser download.'
+        type: string
+        default: ''
+      checks:
+        description: 'Repo-specific guard commands, one per line. Each gets its own summary row.'
+        type: string
+        default: ''
       lint:
         type: string
         default: ''
@@ -137,6 +145,16 @@ jobs:
           set -o pipefail
           bash -c "$CMD" 2>&1 | tee .ci-logs/install.log
 
+      - name: Setup
+        id: setup
+        if: inputs.setup != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.setup }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/setup.log
+
       - name: Lint
         id: lint
         if: inputs.lint != ''
@@ -177,13 +195,43 @@ jobs:
           set -o pipefail
           bash -c "$CMD" 2>&1 | tee .ci-logs/build.log
 
+      - name: Repo checks
+        id: checks
+        if: inputs.checks != ''
+        continue-on-error: true
+        env:
+          CHECKS: ${{ inputs.checks }}
+        run: |
+          set -u
+          : > .ci-logs/checks.tsv
+          overall=0
+          i=0
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            i=$((i + 1))
+            log=".ci-logs/check-$i.log"
+            echo "::group::$cmd"
+            if bash -c "$cmd" > "$log" 2>&1; then
+              res=success
+            else
+              res=failure
+              overall=1
+            fi
+            cat "$log"
+            echo "::endgroup::"
+            printf '%s\t%s\t%s\n' "$res" "$i" "$cmd" >> .ci-logs/checks.tsv
+          done <<< "$CHECKS"
+          echo "Ran $i repo check(s)."
+          exit "$overall"
+
       - name: Summary
         if: always()
         env:
           HEADING: "Node CI — Node ${{ matrix.node-version }}"
           NOTE: "Package manager: `${{ steps.pm.outputs.pm }}` (${{ steps.pm.outputs.why }})"
-          STAGES: "install:Install lint:Lint typecheck:Type check test:Tests build:Build"
+          STAGES: "install:Install setup:Setup lint:Lint typecheck:Type check test:Tests build:Build"
           R_INSTALL: ${{ steps.install.outcome }}
+          R_SETUP: ${{ steps.setup.outcome }}
           R_LINT: ${{ steps.lint.outcome }}
           R_TYPECHECK: ${{ steps.typecheck.outcome }}
           R_TEST: ${{ steps.test.outcome }}
@@ -212,6 +260,11 @@ jobs:
             res="$(eval "printf '%s' \"\${$var:-}\"")"
             echo "| $name | $(label "$res") |" >> "$GITHUB_STEP_SUMMARY"
           done
+          if [ -f .ci-logs/checks.tsv ]; then
+            while IFS="$(printf '\t')" read -r res idx cmd; do
+              echo "| \`$cmd\` | $(label "$res") |" >> "$GITHUB_STEP_SUMMARY"
+            done < .ci-logs/checks.tsv
+          fi
           for pair in $STAGES; do
             key="${pair%%:*}"
             var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
@@ -229,12 +282,29 @@ jobs:
               } >> "$GITHUB_STEP_SUMMARY"
             fi
           done
+          if [ -f .ci-logs/checks.tsv ]; then
+            while IFS="$(printf '\t')" read -r res idx cmd; do
+              if [ "$res" = "failure" ] && [ -f ".ci-logs/check-$idx.log" ]; then
+                {
+                  echo
+                  echo "<details><summary>$cmd — last 40 lines</summary>"
+                  echo
+                  echo '```'
+                  tail -n 40 ".ci-logs/check-$idx.log"
+                  echo '```'
+                  echo
+                  echo "</details>"
+                } >> "$GITHUB_STEP_SUMMARY"
+              fi
+            done < .ci-logs/checks.tsv
+          fi
 
       - name: Upload logs when a stage failed
         if: >-
-          steps.install.outcome == 'failure' || steps.lint.outcome == 'failure' ||
-          steps.typecheck.outcome == 'failure' || steps.test.outcome == 'failure' ||
-          steps.build.outcome == 'failure'
+          steps.install.outcome == 'failure' || steps.setup.outcome == 'failure' ||
+          steps.lint.outcome == 'failure' || steps.typecheck.outcome == 'failure' ||
+          steps.test.outcome == 'failure' || steps.build.outcome == 'failure' ||
+          steps.checks.outcome == 'failure'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-logs-node-${{ matrix.node-version }}
@@ -246,14 +316,16 @@ jobs:
         if: always()
         env:
           R_INSTALL: ${{ steps.install.outcome }}
+          R_SETUP: ${{ steps.setup.outcome }}
           R_LINT: ${{ steps.lint.outcome }}
           R_TYPECHECK: ${{ steps.typecheck.outcome }}
           R_TEST: ${{ steps.test.outcome }}
           R_BUILD: ${{ steps.build.outcome }}
+          R_CHECKS: ${{ steps.checks.outcome }}
         run: |
           set -u
           fail=0
-          for r in "${R_INSTALL:-}" "${R_LINT:-}" "${R_TYPECHECK:-}" "${R_TEST:-}" "${R_BUILD:-}"; do
+          for r in "${R_INSTALL:-}" "${R_SETUP:-}" "${R_LINT:-}" "${R_TYPECHECK:-}" "${R_TEST:-}" "${R_BUILD:-}" "${R_CHECKS:-}"; do
             [ "$r" = "failure" ] && fail=1
           done
           if [ "$fail" != "0" ]; then
