@@ -1,0 +1,263 @@
+name: Node CI
+
+# Reusable CI for Node/TypeScript repos. Callers pass the scripts their repo
+# actually defines; every stage is optional and is skipped when its input is
+# empty. The package manager is detected from the lockfile unless overridden.
+#
+# Every stage runs even when an earlier one fails, so a single run reports every
+# problem instead of only the first. The job still fails if any stage failed.
+
+on:
+  workflow_call:
+    inputs:
+      node-versions:
+        description: 'JSON array of Node versions, e.g. ["22"] or ["20","22"]'
+        type: string
+        default: '["22"]'
+      package-manager:
+        description: 'pnpm, npm, or empty to detect from the lockfile'
+        type: string
+        default: ''
+      install:
+        description: 'Install command. Empty means the package manager default.'
+        type: string
+        default: ''
+      lint:
+        type: string
+        default: ''
+      typecheck:
+        type: string
+        default: ''
+      test:
+        type: string
+        default: ''
+      build:
+        type: string
+        default: ''
+      working-directory:
+        type: string
+        default: '.'
+      timeout-minutes:
+        type: number
+        default: 15
+      runs-on:
+        type: string
+        default: 'ubuntu-latest'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: node ${{ matrix.node-version }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ${{ fromJSON(inputs.node-versions) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect package manager
+        id: pm
+        env:
+          EXPLICIT: ${{ inputs.package-manager }}
+          EXPLICIT_INSTALL: ${{ inputs.install }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-logs
+          if [ -n "$EXPLICIT" ]; then
+            pm="$EXPLICIT"; why="caller-supplied"
+          elif [ -f pnpm-lock.yaml ]; then
+            pm=pnpm; why="pnpm-lock.yaml present"
+          elif [ -f package-lock.json ]; then
+            pm=npm; why="package-lock.json present"
+          elif [ -f package.json ]; then
+            pm=npm; why="package.json with no lockfile"
+          else
+            pm=none; why="no package.json found"
+          fi
+          if [ -n "$EXPLICIT_INSTALL" ]; then
+            install="$EXPLICIT_INSTALL"
+          elif [ "$pm" = "pnpm" ]; then
+            install="pnpm install --frozen-lockfile"
+          elif [ "$pm" = "npm" ] && [ -f package-lock.json ]; then
+            install="npm ci"
+          elif [ "$pm" = "npm" ]; then
+            install="npm install"
+          else
+            install=":"
+          fi
+          # Only enable setup-node's cache when the lockfile it keys on exists,
+          # otherwise the action fails on an unresolvable cache-dependency-path.
+          cache=""
+          cache_path=""
+          if [ "$pm" = "pnpm" ] && [ -f pnpm-lock.yaml ]; then
+            cache="pnpm"; cache_path="pnpm-lock.yaml"
+          elif [ "$pm" = "npm" ] && [ -f package-lock.json ]; then
+            cache="npm"; cache_path="package-lock.json"
+          fi
+          {
+            echo "pm=$pm"
+            echo "why=$why"
+            echo "cache=$cache"
+            echo "cache_path=$cache_path"
+            echo "install<<CI_EOF"
+            echo "$install"
+            echo "CI_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Package manager: $pm ($why)"
+          echo "Install command: $install"
+          echo "Dependency cache: ${cache:-disabled (no lockfile)}"
+
+      - name: Set up pnpm
+        if: steps.pm.outputs.pm == 'pnpm'
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
+      - name: Set up Node ${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: ${{ steps.pm.outputs.cache }}
+          cache-dependency-path: ${{ steps.pm.outputs.cache_path && format('{0}/{1}', inputs.working-directory, steps.pm.outputs.cache_path) || '' }}
+
+      - name: Install dependencies
+        id: install
+        continue-on-error: true
+        env:
+          CMD: ${{ steps.pm.outputs.install }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/install.log
+
+      - name: Lint
+        id: lint
+        if: inputs.lint != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.lint }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/lint.log
+
+      - name: Type check
+        id: typecheck
+        if: inputs.typecheck != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.typecheck }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/typecheck.log
+
+      - name: Tests
+        id: test
+        if: inputs.test != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.test }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/test.log
+
+      - name: Build
+        id: build
+        if: inputs.build != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.build }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/build.log
+
+      - name: Summary
+        if: always()
+        env:
+          HEADING: "Node CI — Node ${{ matrix.node-version }}"
+          NOTE: "Package manager: `${{ steps.pm.outputs.pm }}` (${{ steps.pm.outputs.why }})"
+          STAGES: "install:Install lint:Lint typecheck:Type check test:Tests build:Build"
+          R_INSTALL: ${{ steps.install.outcome }}
+          R_LINT: ${{ steps.lint.outcome }}
+          R_TYPECHECK: ${{ steps.typecheck.outcome }}
+          R_TEST: ${{ steps.test.outcome }}
+          R_BUILD: ${{ steps.build.outcome }}
+        run: |
+          set -u
+          label() {
+            case "$1" in
+              success) echo ':white_check_mark: pass' ;;
+              failure) echo ':x: FAIL' ;;
+              skipped|'') echo ':heavy_minus_sign: skipped' ;;
+              *) echo "$1" ;;
+            esac
+          }
+          {
+            echo "## $HEADING"
+            echo
+            echo "$NOTE"
+            echo
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for pair in $STAGES; do
+            key="${pair%%:*}"; name="${pair#*:}"
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            echo "| $name | $(label "$res") |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          for pair in $STAGES; do
+            key="${pair%%:*}"
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            if [ "$res" = "failure" ] && [ -f ".ci-logs/$key.log" ]; then
+              {
+                echo
+                echo "<details><summary>$key — last 40 lines</summary>"
+                echo
+                echo '```'
+                tail -n 40 ".ci-logs/$key.log"
+                echo '```'
+                echo
+                echo "</details>"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - name: Upload logs when a stage failed
+        if: >-
+          steps.install.outcome == 'failure' || steps.lint.outcome == 'failure' ||
+          steps.typecheck.outcome == 'failure' || steps.test.outcome == 'failure' ||
+          steps.build.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-logs-node-${{ matrix.node-version }}
+          path: ${{ inputs.working-directory }}/.ci-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Fail if any stage failed
+        if: always()
+        env:
+          R_INSTALL: ${{ steps.install.outcome }}
+          R_LINT: ${{ steps.lint.outcome }}
+          R_TYPECHECK: ${{ steps.typecheck.outcome }}
+          R_TEST: ${{ steps.test.outcome }}
+          R_BUILD: ${{ steps.build.outcome }}
+        run: |
+          set -u
+          fail=0
+          for r in "${R_INSTALL:-}" "${R_LINT:-}" "${R_TYPECHECK:-}" "${R_TEST:-}" "${R_BUILD:-}"; do
+            [ "$r" = "failure" ] && fail=1
+          done
+          if [ "$fail" != "0" ]; then
+            echo "::error::One or more CI stages failed. The job summary has the stage table and the tail of each failing log."
+            exit 1
+          fi
+          echo "All stages passed."

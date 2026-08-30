@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # Keeps the SHA pins in the reusable workflows current. Dependabot rewrites the
+  # pin to the new commit and updates the trailing version comment, so pinning
+  # does not mean going stale.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Wait a week before proposing a new release. A compromised or broken action
+    # release is usually caught and yanked inside that window.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]

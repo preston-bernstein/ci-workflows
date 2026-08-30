@@ -1,0 +1,192 @@
+name: Go CI
+
+# Reusable CI for Go repos. The Go version comes from go.mod by default, so a
+# module bump does not need a matching CI edit.
+#
+# Every stage runs even when an earlier one fails, so a single run reports every
+# problem instead of only the first. The job still fails if any stage failed.
+
+on:
+  workflow_call:
+    inputs:
+      go-version-file:
+        type: string
+        default: 'go.mod'
+      go-version:
+        description: 'Explicit Go version. Overrides go-version-file when set.'
+        type: string
+        default: ''
+      build:
+        type: string
+        default: 'go build ./...'
+      vet:
+        type: string
+        default: 'go vet ./...'
+      test:
+        type: string
+        default: 'go test -race ./...'
+      golangci-lint:
+        description: 'Run golangci-lint. Off by default so it is opt-in per repo.'
+        type: boolean
+        default: false
+      working-directory:
+        type: string
+        default: '.'
+      timeout-minutes:
+        type: number
+        default: 15
+      runs-on:
+        type: string
+        default: 'ubuntu-latest'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: go
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ inputs.go-version }}
+          go-version-file: ${{ inputs.go-version == '' && format('{0}/{1}', inputs.working-directory, inputs.go-version-file) || '' }}
+          cache-dependency-path: ${{ inputs.working-directory }}/go.sum
+
+      - name: Record toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-logs
+          echo "version=$(go version)" >> "$GITHUB_OUTPUT"
+          go version
+
+      - name: Build
+        id: build
+        if: inputs.build != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.build }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/build.log
+
+      - name: Vet
+        id: vet
+        if: inputs.vet != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.vet }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/vet.log
+
+      - name: golangci-lint
+        id: lint
+        if: inputs.golangci-lint
+        continue-on-error: true
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Tests
+        id: test
+        if: inputs.test != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.test }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/test.log
+
+      - name: Summary
+        if: always()
+        env:
+          HEADING: "Go CI"
+          NOTE: "Toolchain: ${{ steps.toolchain.outputs.version }}"
+          STAGES: "build:Build vet:Vet lint:golangci-lint test:Tests"
+          R_BUILD: ${{ steps.build.outcome }}
+          R_VET: ${{ steps.vet.outcome }}
+          R_LINT: ${{ steps.lint.outcome }}
+          R_TEST: ${{ steps.test.outcome }}
+        run: |
+          set -u
+          label() {
+            case "$1" in
+              success) echo ':white_check_mark: pass' ;;
+              failure) echo ':x: FAIL' ;;
+              skipped|'') echo ':heavy_minus_sign: skipped' ;;
+              *) echo "$1" ;;
+            esac
+          }
+          {
+            echo "## $HEADING"
+            echo
+            echo "$NOTE"
+            echo
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for pair in $STAGES; do
+            key="${pair%%:*}"; name="${pair#*:}"
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            echo "| $name | $(label "$res") |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          for pair in $STAGES; do
+            key="${pair%%:*}"
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            if [ "$res" = "failure" ] && [ -f ".ci-logs/$key.log" ]; then
+              {
+                echo
+                echo "<details><summary>$key — last 40 lines</summary>"
+                echo
+                echo '```'
+                tail -n 40 ".ci-logs/$key.log"
+                echo '```'
+                echo
+                echo "</details>"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - name: Upload logs when a stage failed
+        if: >-
+          steps.build.outcome == 'failure' || steps.vet.outcome == 'failure' ||
+          steps.test.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-logs-go
+          path: ${{ inputs.working-directory }}/.ci-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Fail if any stage failed
+        if: always()
+        env:
+          R_BUILD: ${{ steps.build.outcome }}
+          R_VET: ${{ steps.vet.outcome }}
+          R_LINT: ${{ steps.lint.outcome }}
+          R_TEST: ${{ steps.test.outcome }}
+        run: |
+          set -u
+          fail=0
+          for r in "${R_BUILD:-}" "${R_VET:-}" "${R_LINT:-}" "${R_TEST:-}"; do
+            [ "$r" = "failure" ] && fail=1
+          done
+          if [ "$fail" != "0" ]; then
+            echo "::error::One or more CI stages failed. The job summary has the stage table and the tail of each failing log."
+            exit 1
+          fi
+          echo "All stages passed."

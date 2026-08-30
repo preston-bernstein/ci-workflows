@@ -1,0 +1,216 @@
+name: Shell CI
+
+# Reusable CI for shell-script repos.
+#
+# ShellCheck comes from the runner image rather than a third-party action:
+# ludeeus/action-shellcheck has had no release since January 2023, and one repo
+# here was pinned to its `master` branch, which is a moving reference.
+#
+# `checks` takes one shell command per line, so a repo's own guard scripts run
+# in the same job and each gets its own row in the summary table.
+
+on:
+  workflow_call:
+    inputs:
+      shellcheck:
+        description: 'Run ShellCheck over discovered shell scripts.'
+        type: boolean
+        default: true
+      shellcheck-severity:
+        description: 'error, warning, info, or style'
+        type: string
+        default: 'warning'
+      shellcheck-paths:
+        description: 'Paths to search for scripts. Empty means the whole repo.'
+        type: string
+        default: ''
+      shellcheck-exclude:
+        description: 'Comma-separated ShellCheck codes to exclude, e.g. SC1091,SC2086'
+        type: string
+        default: ''
+      checks:
+        description: 'One command per line. Each runs and reports separately.'
+        type: string
+        default: ''
+      working-directory:
+        type: string
+        default: '.'
+      timeout-minutes:
+        type: number
+        default: 10
+      runs-on:
+        type: string
+        default: 'ubuntu-latest'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: shell
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Discover shell scripts
+        id: discover
+        env:
+          PATHS: ${{ inputs.shellcheck-paths }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-logs
+          # Match by extension and by shebang, so extensionless scripts are covered.
+          if [ -n "$PATHS" ]; then
+            roots="$PATHS"
+          else
+            roots="."
+          fi
+          # shellcheck disable=SC2086
+          find $roots -type f -not -path './.git/*' -print0 2>/dev/null \
+            | while IFS= read -r -d '' f; do
+                case "$f" in
+                  *.sh|*.bash) printf '%s\n' "$f" ;;
+                  *) head -c 100 "$f" 2>/dev/null | head -n 1 | grep -qE '^#!.*\b(ba|da|k|z)?sh\b' && printf '%s\n' "$f" ;;
+                esac
+              done | sort > .ci-logs/scripts.txt || true
+          count=$(wc -l < .ci-logs/scripts.txt | tr -d ' ')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Found $count shell script(s)."
+          cat .ci-logs/scripts.txt
+
+      - name: ShellCheck
+        id: shellcheck
+        if: inputs.shellcheck && steps.discover.outputs.count != '0'
+        continue-on-error: true
+        env:
+          SEVERITY: ${{ inputs.shellcheck-severity }}
+          EXCLUDE: ${{ inputs.shellcheck-exclude }}
+        run: |
+          set -o pipefail
+          shellcheck --version
+          args="--severity=$SEVERITY --external-sources"
+          if [ -n "$EXCLUDE" ]; then
+            args="$args --exclude=$EXCLUDE"
+          fi
+          # shellcheck disable=SC2086
+          xargs -a .ci-logs/scripts.txt shellcheck $args 2>&1 | tee .ci-logs/shellcheck.log
+
+      - name: Repo checks
+        id: checks
+        if: inputs.checks != ''
+        continue-on-error: true
+        env:
+          CHECKS: ${{ inputs.checks }}
+        run: |
+          set -u
+          : > .ci-logs/checks.tsv
+          overall=0
+          i=0
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            i=$((i + 1))
+            log=".ci-logs/check-$i.log"
+            echo "::group::$cmd"
+            if bash -c "$cmd" > "$log" 2>&1; then
+              res=success
+            else
+              res=failure
+              overall=1
+            fi
+            cat "$log"
+            echo "::endgroup::"
+            printf '%s\t%s\t%s\n' "$res" "$i" "$cmd" >> .ci-logs/checks.tsv
+          done <<< "$CHECKS"
+          echo "Ran $i repo check(s)."
+          exit "$overall"
+
+      - name: Summary
+        if: always()
+        env:
+          SCRIPT_COUNT: ${{ steps.discover.outputs.count }}
+          R_SHELLCHECK: ${{ steps.shellcheck.outcome }}
+        run: |
+          set -u
+          label() {
+            case "$1" in
+              success) echo ':white_check_mark: pass' ;;
+              failure) echo ':x: FAIL' ;;
+              skipped|'') echo ':heavy_minus_sign: skipped' ;;
+              *) echo "$1" ;;
+            esac
+          }
+          {
+            echo "## Shell CI"
+            echo
+            echo "Shell scripts discovered: ${SCRIPT_COUNT:-0}"
+            echo
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+            echo "| ShellCheck | $(label "${R_SHELLCHECK:-}") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f .ci-logs/checks.tsv ]; then
+            while IFS="$(printf '\t')" read -r res idx cmd; do
+              echo "| \`$cmd\` | $(label "$res") |" >> "$GITHUB_STEP_SUMMARY"
+            done < .ci-logs/checks.tsv
+          fi
+          if [ "${R_SHELLCHECK:-}" = "failure" ] && [ -f .ci-logs/shellcheck.log ]; then
+            {
+              echo
+              echo "<details><summary>ShellCheck — last 60 lines</summary>"
+              echo
+              echo '```'
+              tail -n 60 .ci-logs/shellcheck.log
+              echo '```'
+              echo
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f .ci-logs/checks.tsv ]; then
+            while IFS="$(printf '\t')" read -r res idx cmd; do
+              if [ "$res" = "failure" ] && [ -f ".ci-logs/check-$idx.log" ]; then
+                {
+                  echo
+                  echo "<details><summary>$cmd — last 40 lines</summary>"
+                  echo
+                  echo '```'
+                  tail -n 40 ".ci-logs/check-$idx.log"
+                  echo '```'
+                  echo
+                  echo "</details>"
+                } >> "$GITHUB_STEP_SUMMARY"
+              fi
+            done < .ci-logs/checks.tsv
+          fi
+
+      - name: Upload logs when a stage failed
+        if: steps.shellcheck.outcome == 'failure' || steps.checks.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-logs-shell
+          path: ${{ inputs.working-directory }}/.ci-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Fail if any stage failed
+        if: always()
+        env:
+          R_SHELLCHECK: ${{ steps.shellcheck.outcome }}
+          R_CHECKS: ${{ steps.checks.outcome }}
+        run: |
+          set -u
+          fail=0
+          for r in "${R_SHELLCHECK:-}" "${R_CHECKS:-}"; do
+            [ "$r" = "failure" ] && fail=1
+          done
+          if [ "$fail" != "0" ]; then
+            echo "::error::One or more CI stages failed. The job summary has the stage table and the tail of each failing log."
+            exit 1
+          fi
+          echo "All stages passed."

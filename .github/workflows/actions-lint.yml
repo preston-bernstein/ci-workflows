@@ -1,0 +1,152 @@
+name: Workflow lint
+
+# Reusable workflow that lints a repo's own GitHub Actions workflow files.
+#
+# actionlint catches YAML and expression mistakes that otherwise only surface as
+# a failed run. zizmor catches security problems: unpinned actions, script
+# injection through `${{ }}` inside `run:`, and over-broad token permissions.
+#
+# Both tools are installed from pinned versions so a new upstream release cannot
+# turn this workflow red without a deliberate bump here.
+
+on:
+  workflow_call:
+    inputs:
+      actionlint-version:
+        type: string
+        default: '1.7.12'
+      zizmor-version:
+        type: string
+        default: '1.29.0'
+      zizmor-persona:
+        description: 'regular, pedantic, or auditor'
+        type: string
+        default: 'regular'
+      zizmor-min-severity:
+        description: 'unknown, informational, low, medium, high'
+        type: string
+        default: 'medium'
+      fail-on-zizmor:
+        description: 'Fail the job on zizmor findings. Off while a repo works through its backlog.'
+        type: boolean
+        default: true
+      timeout-minutes:
+        type: number
+        default: 10
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: workflow lint
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint
+        env:
+          VERSION: ${{ inputs.actionlint-version }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-logs "$HOME/.local/bin"
+          url="https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
+          curl -fsSL "$url" -o /tmp/actionlint.tar.gz
+          tar -xzf /tmp/actionlint.tar.gz -C "$HOME/.local/bin" actionlint
+          chmod +x "$HOME/.local/bin/actionlint"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: actionlint
+        id: actionlint
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          actionlint --version
+          actionlint -color 2>&1 | tee .ci-logs/actionlint.log
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: zizmor
+        id: zizmor
+        continue-on-error: true
+        env:
+          VERSION: ${{ inputs.zizmor-version }}
+          PERSONA: ${{ inputs.zizmor-persona }}
+          MIN_SEVERITY: ${{ inputs.zizmor-min-severity }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+          uvx "zizmor@${VERSION}" \
+            --persona "$PERSONA" \
+            --min-severity "$MIN_SEVERITY" \
+            --format plain \
+            . 2>&1 | tee .ci-logs/zizmor.log
+
+      - name: Summary
+        if: always()
+        env:
+          R_ACTIONLINT: ${{ steps.actionlint.outcome }}
+          R_ZIZMOR: ${{ steps.zizmor.outcome }}
+          ZIZMOR_ENFORCED: ${{ inputs.fail-on-zizmor }}
+        run: |
+          set -u
+          label() {
+            case "$1" in
+              success) echo ':white_check_mark: pass' ;;
+              failure) echo ':x: FAIL' ;;
+              skipped|'') echo ':heavy_minus_sign: skipped' ;;
+              *) echo "$1" ;;
+            esac
+          }
+          {
+            echo "## Workflow lint"
+            echo
+            echo "| Tool | What it checks | Result |"
+            echo "| --- | --- | --- |"
+            echo "| actionlint | workflow syntax, expressions, shell in \`run:\` | $(label "${R_ACTIONLINT:-}") |"
+            echo "| zizmor | unpinned actions, script injection, token scope | $(label "${R_ZIZMOR:-}") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ZIZMOR_ENFORCED" != "true" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "zizmor findings are reported but not enforced in this repo." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          for pair in actionlint:R_ACTIONLINT zizmor:R_ZIZMOR; do
+            key="${pair%%:*}"; var="${pair#*:}"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            if [ "$res" = "failure" ] && [ -f ".ci-logs/$key.log" ]; then
+              {
+                echo
+                echo "<details><summary>$key findings</summary>"
+                echo
+                echo '```'
+                tail -n 80 ".ci-logs/$key.log"
+                echo '```'
+                echo
+                echo "</details>"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - name: Fail if a linter failed
+        if: always()
+        env:
+          R_ACTIONLINT: ${{ steps.actionlint.outcome }}
+          R_ZIZMOR: ${{ steps.zizmor.outcome }}
+          ZIZMOR_ENFORCED: ${{ inputs.fail-on-zizmor }}
+        run: |
+          set -u
+          fail=0
+          [ "${R_ACTIONLINT:-}" = "failure" ] && fail=1
+          if [ "$ZIZMOR_ENFORCED" = "true" ] && [ "${R_ZIZMOR:-}" = "failure" ]; then
+            fail=1
+          fi
+          if [ "$fail" != "0" ]; then
+            echo "::error::Workflow lint found problems. The job summary lists them."
+            exit 1
+          fi
+          echo "Workflow lint clean."

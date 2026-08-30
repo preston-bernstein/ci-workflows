@@ -1,0 +1,241 @@
+name: Python CI
+
+# Reusable CI for Python repos. Callers pass the commands their repo actually
+# uses; every stage is optional and is skipped when its input is empty.
+#
+# Every stage runs even when an earlier one fails, so a single run reports every
+# problem instead of only the first. The job still fails if any stage failed.
+#
+# All command inputs are passed through the environment rather than interpolated
+# into the shell, so a value containing shell metacharacters cannot inject code.
+
+on:
+  workflow_call:
+    inputs:
+      python-versions:
+        description: 'JSON array of Python versions to test, e.g. ["3.11","3.12"]'
+        type: string
+        default: '["3.12"]'
+      install:
+        description: 'Dependency install command. Empty means auto-detect.'
+        type: string
+        default: ''
+      lint:
+        description: 'Lint command. Empty skips the stage.'
+        type: string
+        default: 'ruff check .'
+      format-check:
+        description: 'Format check command. Empty skips the stage.'
+        type: string
+        default: ''
+      typecheck:
+        description: 'Type check command. Empty skips the stage.'
+        type: string
+        default: ''
+      test:
+        description: 'Test command. Empty skips the stage.'
+        type: string
+        default: 'pytest -q'
+      working-directory:
+        type: string
+        default: '.'
+      timeout-minutes:
+        type: number
+        default: 15
+      runs-on:
+        type: string
+        default: 'ubuntu-latest'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: python ${{ matrix.python-version }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Resolve install command
+        id: resolve
+        env:
+          EXPLICIT: ${{ inputs.install }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-logs
+          if [ -n "$EXPLICIT" ]; then
+            cmd="$EXPLICIT"
+            why="caller-supplied"
+          elif [ -f pyproject.toml ] && grep -qE '^\s*(dev|test)\s*=\s*\[' pyproject.toml; then
+            cmd='pip install -e ".[dev,test]" || pip install -e ".[dev]" || pip install -e ".[test]" || pip install -e .'
+            why="pyproject.toml with dev/test extras"
+          elif [ -f pyproject.toml ]; then
+            cmd='pip install -e .'
+            why="pyproject.toml, no dev/test extras detected"
+          elif [ -f requirements.txt ]; then
+            cmd='pip install -r requirements.txt'
+            why="requirements.txt"
+          else
+            cmd=':'
+            why="no dependency manifest found"
+          fi
+          {
+            echo "cmd<<CI_EOF"
+            echo "$cmd"
+            echo "CI_EOF"
+            echo "why=$why"
+          } >> "$GITHUB_OUTPUT"
+          echo "Install strategy: $why"
+          echo "Command: $cmd"
+
+      - name: Install dependencies
+        id: install
+        continue-on-error: true
+        env:
+          CMD: ${{ steps.resolve.outputs.cmd }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/install.log
+
+      - name: Lint
+        id: lint
+        if: inputs.lint != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.lint }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/lint.log
+
+      - name: Format check
+        id: format
+        if: inputs.format-check != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.format-check }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/format.log
+
+      - name: Type check
+        id: typecheck
+        if: inputs.typecheck != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.typecheck }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/typecheck.log
+
+      - name: Tests
+        id: test
+        if: inputs.test != ''
+        continue-on-error: true
+        env:
+          CMD: ${{ inputs.test }}
+        run: |
+          set -o pipefail
+          bash -c "$CMD" 2>&1 | tee .ci-logs/test.log
+
+      - name: Summary
+        if: always()
+        env:
+          HEADING: "Python CI — Python ${{ matrix.python-version }}"
+          NOTE: "Install strategy: ${{ steps.resolve.outputs.why }}"
+          STAGES: "install:Install lint:Lint format:Format typecheck:Type check test:Tests"
+          R_INSTALL: ${{ steps.install.outcome }}
+          R_LINT: ${{ steps.lint.outcome }}
+          R_FORMAT: ${{ steps.format.outcome }}
+          R_TYPECHECK: ${{ steps.typecheck.outcome }}
+          R_TEST: ${{ steps.test.outcome }}
+        run: |
+          set -u
+          label() {
+            case "$1" in
+              success) echo ':white_check_mark: pass' ;;
+              failure) echo ':x: FAIL' ;;
+              skipped|'') echo ':heavy_minus_sign: skipped' ;;
+              *) echo "$1" ;;
+            esac
+          }
+          {
+            echo "## $HEADING"
+            echo
+            echo "$NOTE"
+            echo
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for pair in $STAGES; do
+            key="${pair%%:*}"
+            name="${pair#*:}"
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            echo "| $name | $(label "$res") |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          for pair in $STAGES; do
+            key="${pair%%:*}"
+            var="R_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+            res="$(eval "printf '%s' \"\${$var:-}\"")"
+            if [ "$res" = "failure" ] && [ -f ".ci-logs/$key.log" ]; then
+              {
+                echo
+                echo "<details><summary>$key — last 40 lines</summary>"
+                echo
+                echo '```'
+                tail -n 40 ".ci-logs/$key.log"
+                echo '```'
+                echo
+                echo "</details>"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - name: Upload logs when a stage failed
+        if: >-
+          steps.install.outcome == 'failure' || steps.lint.outcome == 'failure' ||
+          steps.format.outcome == 'failure' || steps.typecheck.outcome == 'failure' ||
+          steps.test.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-logs-python-${{ matrix.python-version }}
+          path: ${{ inputs.working-directory }}/.ci-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Fail if any stage failed
+        if: always()
+        env:
+          R_INSTALL: ${{ steps.install.outcome }}
+          R_LINT: ${{ steps.lint.outcome }}
+          R_FORMAT: ${{ steps.format.outcome }}
+          R_TYPECHECK: ${{ steps.typecheck.outcome }}
+          R_TEST: ${{ steps.test.outcome }}
+        run: |
+          set -u
+          fail=0
+          for r in "${R_INSTALL:-}" "${R_LINT:-}" "${R_FORMAT:-}" "${R_TYPECHECK:-}" "${R_TEST:-}"; do
+            [ "$r" = "failure" ] && fail=1
+          done
+          if [ "$fail" != "0" ]; then
+            echo "::error::One or more CI stages failed. The job summary has the stage table and the tail of each failing log."
+            exit 1
+          fi
+          echo "All stages passed."
