@@ -62,6 +62,13 @@ on:
         description: 'Commits to fetch. 0 fetches full history, which some audit tools need.'
         type: number
         default: 1
+      lfs-include:
+        description: >-
+          Git LFS paths to download after checkout, comma separated, for example
+          "data/prices/TLT.parquet,data/prices/DBC.parquet". Empty downloads none.
+          Name only the files the tests read: each run counts against LFS bandwidth.
+        type: string
+        default: ''
       env:
         description: 'Extra environment variables for every stage, one KEY=VALUE per line.'
         type: string
@@ -98,6 +105,18 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: ${{ inputs.fetch-depth }}
+
+      - name: Pull LFS files
+        if: inputs.lfs-include != ''
+        env:
+          INCLUDE: ${{ inputs.lfs-include }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Checkout keeps no credentials, so pass the token for this one command.
+          auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          git -c "http.extraheader=AUTHORIZATION: basic ${auth}" lfs pull --include "$INCLUDE"
+          git lfs ls-files --include "$INCLUDE"
 
       - name: Apply extra environment
         if: inputs.env != ''
