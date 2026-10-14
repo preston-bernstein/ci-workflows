@@ -62,6 +62,7 @@ Beyond the stage commands, each workflow takes:
 | `setup` | A command between install and the stages, such as a browser download |
 | `checks` | Repo-specific guard commands, one per line, each with its own summary row |
 | `fetch-depth` | `0` when a tool diffs against the base ref and needs full history |
+| `lfs-include` | Git LFS paths to download, comma separated. Name only the files the tests read |
 | `env` | Extra environment variables for every stage, one `KEY=VALUE` per line |
 | `non-blocking` | Stage keys that report a failure without failing the job |
 | `timeout-minutes` | Overrides the default for a slow suite |
