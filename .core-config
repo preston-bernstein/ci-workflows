@@ -1,0 +1,1 @@
+CORE_DUP_THRESHOLD=32  # existing duplication is 31.47%; lower it as clones are removed
