@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Run once per clone: git config core.hooksPath .githooks
+# CI runs the same scripts, because a hook can be skipped.
+set -euo pipefail
+root="$(git rev-parse --show-toplevel)"
+bash "$root/scripts/core-validate.sh"
+bash "$root/scripts/gha-validate.sh"
+bash "$root/scripts/writing-validate.sh"

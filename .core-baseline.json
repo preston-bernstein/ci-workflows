@@ -1,0 +1,37 @@
+{
+ "_reason": "Existing over-limit functions accepted on 2026-11-16; new code must stay within the limits. Fix them when touched.",
+ "functions": {
+  "scripts/core-check.py::main": {
+   "ccn": 20,
+   "token": 330,
+   "nd": 0,
+   "param": 1,
+   "length": 32,
+   "nloc": 32
+  },
+  "scripts/core-lizard.py::main": {
+   "ccn": 13,
+   "token": 331,
+   "nd": 0,
+   "param": 1,
+   "length": 27,
+   "nloc": 27
+  },
+  "scripts/core-lizard.py::run_lizard": {
+   "ccn": 11,
+   "token": 304,
+   "nd": 0,
+   "param": 2,
+   "length": 24,
+   "nloc": 24
+  },
+  "scripts/workflow-check.py::check_workflow": {
+   "ccn": 42,
+   "token": 631,
+   "nd": 0,
+   "param": 1,
+   "length": 73,
+   "nloc": 62
+  }
+ }
+}

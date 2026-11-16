@@ -1,1 +1,1 @@
-CORE_DUP_THRESHOLD=32  # existing duplication is 31.47%; lower it as clones are removed
+CORE_DUP_THRESHOLD=22  # duplication is 21.79% (mostly the repeated workflow steps); lower it as clones are removed
