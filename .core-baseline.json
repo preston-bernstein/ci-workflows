@@ -1,5 +1,5 @@
 {
- "_reason": "Existing over-limit functions accepted on 2026-11-16; new code must stay within the limits. Fix them when touched.",
+ "_reason": "All four are verbatim copies of the pack gate scripts; AGENTS.md says scripts/* stay unchanged and are updated by copying from the pack, so they are vendored.",
  "functions": {
   "scripts/core-check.py::main": {
    "ccn": 20,
