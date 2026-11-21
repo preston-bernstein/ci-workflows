@@ -115,13 +115,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -o pipefail
-          args=""
+          args=()
           if [ -n "$CONFIG" ]; then
-            args="--config $CONFIG"
+            args=(--config "$CONFIG")
           fi
-          # shellcheck disable=SC2086
           uvx "zizmor@${VERSION}" \
-            $args \
+            ${args[@]+"${args[@]}"} \
             --persona "$PERSONA" \
             --min-severity "$MIN_SEVERITY" \
             --format plain \

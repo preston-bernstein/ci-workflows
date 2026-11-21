@@ -16,3 +16,32 @@ permissions:
 jobs:
   lint:
     uses: ./.github/workflows/actions-lint.yml
+
+  # The repo gates run once, here. Hooks can be skipped, so CI is the check that counts.
+  # The reusable-workflow lint job above stays: it tests the workflow that callers use.
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install gate tools
+        run: bash scripts/install-gate-tools.sh
+      - name: Core gate
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          bash scripts/core-validate.sh
+      - name: GitHub Actions gate
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          bash scripts/gha-validate.sh
+      - name: Writing gate
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          WRITING_ALL=1 bash scripts/writing-validate.sh
+      - name: Tests
+        run: |
+          python3 -m pip install --quiet pytest==9.2.0 pyyaml==6.0.3
+          python3 -m pytest -q tests

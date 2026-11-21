@@ -1,0 +1,70 @@
+name: Dependabot auto-merge
+
+# Reusable. A caller runs it on `pull_request`. It merges a Dependabot pull request once every other check on the head
+# commit has finished and none failed. It runs only on the plain pull request trigger, never on fork code with secrets, and it needs no secret: the job token can
+# merge because the job asks for contents: write and pull-requests: write.
+#
+# The job waits instead of using `gh pr merge --auto`, because auto-merge needs required checks on the branch and
+# most repos here have none: it would merge before CI ran. A check that registers late is caught by the settle
+# time and by requiring two identical polls in a row.
+#
+# The step skips check runs whose name ends in "automerge". A caller names its job `automerge`, so the check is
+# called "automerge / automerge".
+
+on:
+  workflow_call:
+    inputs:
+      merge-method:
+        description: 'squash, merge or rebase'
+        type: string
+        default: 'squash'
+
+permissions: {}
+
+concurrency:
+  group: automerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  automerge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+    steps:
+      - name: Wait for the other checks, then merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          METHOD: ${{ inputs.merge-method }}
+        run: |
+          set -euo pipefail
+          polls="${AUTOMERGE_POLLS:-90}"
+          pause="${AUTOMERGE_SLEEP:-30}"
+          sleep "${AUTOMERGE_SETTLE:-60}"
+          last=""
+          for _ in $(seq 1 "$polls"); do
+            runs="$(gh api "repos/${REPO}/commits/${SHA}/check-runs?per_page=100" \
+              --jq '[.check_runs[] | select(.name | endswith("automerge") | not) | {s: .status, c: .conclusion}]')"
+            total="$(jq 'length' <<<"$runs")"
+            pending="$(jq '[.[] | select(.s != "completed")] | length' <<<"$runs")"
+            failed="$(jq '[.[] | select(.s == "completed" and (.c | IN("success", "skipped", "neutral") | not))] | length' <<<"$runs")"
+            if [ "$failed" -gt 0 ]; then
+              echo "a check failed: not merging" >&2
+              exit 1
+            fi
+            state="${total}/${pending}"
+            if [ "$total" -gt 0 ] && [ "$pending" -eq 0 ] && [ "$state" = "$last" ]; then
+              gh pr merge "$PR" --repo "$REPO" "--${METHOD}" --delete-branch
+              exit 0
+            fi
+            last="$state"
+            sleep "$pause"
+          done
+          echo "timed out waiting for the other checks" >&2
+          exit 1

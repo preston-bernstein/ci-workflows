@@ -1,19 +1,12 @@
 # ci-workflows
 
-Shared GitHub Actions CI for this account's repositories.
+Reusable GitHub Actions workflows that run CI for all of this account's repositories.
 
-Before this repo existed, every repository carried its own hand-written
-`ci.yml`. Across 36 workflow files there were 165 `uses:` lines, none pinned to a
-commit, spread over several major versions of the same actions. One job in one
-repository set a timeout. Two set `permissions:`. Five set a concurrency group.
-None wrote a job summary, so reading a failure meant opening the run and
-scrolling the raw log.
+Each repository keeps a short caller workflow that names the stages it wants. The shared logic lives here. A change to CI behavior is one edit in this repo, not one edit per repo.
 
-This repository holds one reusable workflow per language. Each repository keeps a
-short caller workflow that says which stages to run. Changing how CI behaves
-everywhere is now an edit to one file here instead of an edit to 36 files.
+## Callers pick stages with inputs
 
-## What a caller looks like
+A caller uses one workflow from this repo and sets the stage commands:
 
 ```yaml
 name: CI
@@ -39,107 +32,74 @@ jobs:
       test: pytest -m "not network"
 ```
 
-The `@v1` reference is a moving tag on this repository. A change here reaches
-every caller once `v1` is moved, and a bad commit on `main` does not.
+`@v1` is a tag that moves. A change reaches callers only when `v1` moves, so a bad commit on `main` does not break them.
 
-## The workflows
+## Five workflows cover the common cases
 
 | Workflow | For | Stages |
 | --- | --- | --- |
 | `python.yml` | Python | install, lint, format check, type check, tests |
-| `node.yml` | Node and TypeScript | install, lint, type check, tests, build |
+| `node.yml` | Node and TypeScript | install, lint, format check, type check, tests, build |
 | `go.yml` | Go | build, vet, golangci-lint, tests |
-| `shell.yml` | shell scripts | ShellCheck, plus any repo guard scripts |
-| `actions-lint.yml` | any repo | actionlint, zizmor |
+| `shell.yml` | shell scripts | ShellCheck, plus your own `checks` |
+| `actions-lint.yml` | any repo | actionlint, zizmor (workflow security linter) |
 
-Every stage input defaults to empty or to the command the repositories already
-ran. An empty input skips that stage, so a caller only names what it wants.
+An empty stage input skips that stage. Some defaults are not empty: `python.yml` runs `ruff check .` and `pytest -q`. Read the `inputs:` block at the top of each file for the full list.
 
-Beyond the stage commands, each workflow takes:
+`python.yml` and `node.yml` share these inputs:
 
-| Input | What it is for |
+| Input | Use |
 | --- | --- |
 | `setup` | A command between install and the stages, such as a browser download |
-| `checks` | Repo-specific guard commands, one per line, each with its own summary row |
-| `fetch-depth` | `0` when a tool diffs against the base ref and needs full history |
-| `lfs-include` | Git LFS paths to download, comma separated. Name only the files the tests read |
-| `env` | Extra environment variables for every stage, one `KEY=VALUE` per line |
+| `checks` | Repo guard commands, one per line. Each gets its own summary row |
 | `non-blocking` | Stage keys that report a failure without failing the job |
-| `timeout-minutes` | Overrides the default for a slow suite |
+| `timeout-minutes` | Overrides the default (15 minutes, or 10 for `shell.yml` and `actions-lint.yml`) |
 | `runs-on` | A different runner label |
+| `working-directory` | Run in a subdirectory |
 
-The Python and Node workflows also accept an `ssh-private-key` secret, for a
-repo whose install pulls a private sibling over SSH:
+`go.yml` takes `non-blocking`, `timeout-minutes`, `runs-on` and `working-directory`, but not `setup` or `checks`. `shell.yml` takes `checks`, `timeout-minutes`, `runs-on` and `working-directory`. `python.yml`, `node.yml` and `go.yml` also take `fetch-depth` and `env`. `python.yml` alone takes `lfs-include`, a comma-separated list of Git LFS paths to download.
+
+`python.yml`, `node.yml` and `go.yml` accept an `ssh-private-key` secret. Use it when the install pulls a private repo over SSH:
 
 ```yaml
     secrets:
       ssh-private-key: ${{ secrets.CREDENTIAL_CRYPTO_DEPLOY_KEY }}
 ```
 
-## What each workflow does that the old ones did not
+## Every stage runs, and failures are easy to read
 
-**Every stage runs, even after one fails.** Stages are marked
-`continue-on-error` and a final step fails the job if any of them failed. One run
-now reports the lint error *and* the test failure, instead of stopping at the
-first and hiding the second until the next push.
+1. Each stage runs even if an earlier one failed. A final step fails the job if any stage failed. One run reports the lint error and the test failure together.
+2. Each job writes a table of stages and results to the run's summary page. Under it, the job inlines the last 40 lines of each failed stage's log. `actions-lint.yml` inlines 80.
+3. Stage logs go to `$RUNNER_TEMP/ci-logs`, outside the checkout. Repo-wide checks in the caller then never see them.
 
-**Failures are readable from the run's summary page.** Each job writes a table of
-stages and results to `$GITHUB_STEP_SUMMARY`, and inlines the last 40 lines of
-any failing stage's log underneath it. Full logs upload as an artifact.
+## The workflows are locked down
 
-Those logs are written to `$RUNNER_TEMP/ci-logs`, outside the checkout. Writing
-them into the working tree meant a repo's own tree-wide checks could see them:
-anno-1800-stamps validates that every tracked file is a zlib stream, and failed
-on the workflow's own log files.
+- Third-party actions are pinned to a 40-character commit SHA, with the version in a trailing comment. Dependabot bumps the pins weekly, after a 7-day wait for new releases.
+- Each workflow sets `permissions: contents: read`. Checkouts set `persist-credentials: false`.
+- Every job has a timeout.
+- `python.yml` picks the install command from `pyproject.toml` or `requirements.txt`. `node.yml` picks pnpm or npm from the lockfile. Both log which one they chose.
+- `shell.yml` uses the ShellCheck that ships on the runner image.
 
-**Actions are pinned to a commit.** A tag like `v4` is a moving reference that
-whoever controls the action can repoint. Every `uses:` here names a 40-character
-commit SHA with the version in a trailing comment. Dependabot bumps them weekly,
-so pinning does not mean going stale.
+## Adopt a check on code that fails it
 
-**Jobs have a timeout.** Without one, a hung step runs until GitHub's six-hour
-limit. Every job here defaults to 10 or 15 minutes.
+Set `non-blocking: lint`. The stage still runs and shows its result in the summary, but it does not fail the job. Remove the line when the backlog is clean. The check then becomes a gate.
 
-**Tokens are read-only.** Each workflow sets `permissions: contents: read`, and
-checkouts set `persist-credentials: false` so the token is not left in
-`.git/config` for later steps to pick up.
+## zizmor allows this account's workflows by tag
 
-**The package manager and install command are detected, not assumed.** The Python
-workflow looks for a `pyproject.toml` with dev extras, then a plain
-`pyproject.toml`, then a `requirements.txt`. The Node workflow reads the lockfile
-to choose pnpm or npm, and turns the dependency cache off when the lockfile it
-would key on is missing, rather than failing on an unresolvable cache path. Both
-print which branch they took, in the log and in the summary.
+`actions-lint.yml` demands a commit SHA for third-party actions. It allows a tag for workflows owned by `trusted-owner` (default `preston-bernstein`). Without this, every `@v1` caller would fail the lint. A repo that has its own `.github/zizmor.yml` keeps it.
 
-**ShellCheck comes from the runner image.** The previous setup used
-`ludeeus/action-shellcheck`, which has had no release since January 2023, and one
-repository referenced its `master` branch — a reference that can change under it
-at any time. The runner already ships ShellCheck.
+`fail-on-zizmor: false` reports zizmor findings without failing the job.
 
-## Adopting a check on a codebase that does not pass it
+## Change a workflow, then move the tag
 
-`non-blocking: lint` runs the stage and marks its result in the summary table,
-but does not fail the job. algo-corpus and algo-factory both configure ruff and
-had never run it, at 36 and 1192 findings; the alternative was a permanently red
-`main` or no linting at all. Deleting the line is what turns the check into a
-gate once the backlog is gone.
+The `self-check` workflow lints this repo on every push and pull request to `main`. Callers use `v1`, not `main`.
 
-## Pinning policy
+1. Merge the change to `main`.
+2. Wait for `self-check` to pass.
+3. Move the tag:
 
-The workflow linter requires a commit SHA for third-party actions, and allows a
-tag only for this account's own reusable workflows. Without that exception,
-`@v1` in every caller counts as an unpinned reference, and satisfying the linter
-would mean editing forty repos for each change here — the thing this repo exists
-to avoid. A repo that ships its own `.github/zizmor.yml` keeps it.
+   ```sh
+   git tag -f v1 && git push -f origin v1
+   ```
 
-## Changing these workflows
-
-`main` is what the `self-check` job lints; `v1` is what callers use. After
-merging a change to `main` and seeing it green, move the tag:
-
-```sh
-git tag -f v1 && git push -f origin v1
-```
-
-Callers pick up the change on their next run. To test a change before moving the
-tag, point one caller at `@main` and push.
+To test first, point one caller at `@main` and push.
